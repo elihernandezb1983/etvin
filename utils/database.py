@@ -755,6 +755,17 @@ async def get_panel(guild_id: int, panel_type: str) -> dict | None:
     return dict(row) if row else None
 
 
+async def get_all_panels(guild_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM panels WHERE guild_id = ? ORDER BY panel_type",
+            (guild_id,),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
 async def get_panel_by_message(message_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row

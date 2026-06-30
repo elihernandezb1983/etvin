@@ -24,6 +24,7 @@ COGS = [
     "cogs.shop",
     "cogs.setup_twitch",
     "cogs.setup_logs",
+    "cogs.summary",
     "cogs.events",
     "cogs.moderation_log",
     "cogs.voice",
