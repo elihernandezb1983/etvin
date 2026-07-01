@@ -181,6 +181,7 @@ def _shop_item_line(guild: discord.Guild, item: dict, admin: str) -> str:
         label = f"**{item['name']}**"
 
     description = (item.get("description") or "").format(admin=admin)
+    description = " ".join(description.split())
     if "роль" in item["name"].lower() and SHOP_SQUAD_INVITE:
         description = f"{description}\nИнвайт в сквад: {SHOP_SQUAD_INVITE}"
 
