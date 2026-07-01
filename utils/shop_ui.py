@@ -14,42 +14,63 @@ from utils.database import (
 from utils.permissions import is_admin
 
 BLACK = 0x000000
-GREEN = 0x57F287
-RED = 0xED4245
 
 
 def _ts() -> str:
     return f"<t:{int(discord.utils.utcnow().timestamp())}:f>"
 
 
-def v2_view(body: str, accent: int = BLACK) -> discord.ui.LayoutView:
-    view = discord.ui.LayoutView()
-    container = discord.ui.Container(accent_color=discord.Color(accent))
-    container.add_item(discord.ui.TextDisplay(body))
-    view.add_item(container)
-    return view
+def build_admin_points_embeds(guild: discord.Guild, rows: list[dict]) -> list[discord.Embed]:
+    if not rows:
+        return [
+            discord.Embed(
+                title="💰 Баллы участников",
+                description="— пока никого с баллами",
+                color=discord.Color(BLACK),
+            )
+        ]
 
+    total_points = sum(row["points"] for row in rows)
+    lines: list[str] = []
+    for i, row in enumerate(rows, start=1):
+        member = guild.get_member(row["user_id"])
+        label = member.mention if member else f"<@{row['user_id']}>"
+        lines.append(f"**{i}.** {label} — **{row['points']}** б.")
 
-def verdict_dm_view(*, accepted: bool, prize_name: str, cost: int, note: str = "") -> discord.ui.LayoutView:
-    if accepted:
-        title = "✅ Заявка одобрена"
-        accent = GREEN
-        status = "Админ принял заявку. Приз будет выдан."
-    else:
-        title = "❌ Заявка отклонена"
-        accent = RED
-        status = f"Баллы возвращены на баланс (**{cost}**)."
+    embeds: list[discord.Embed] = []
+    chunk: list[str] = []
+    chunk_len = 0
+    page = 1
+    for line in lines:
+        line_len = len(line) + 1
+        if chunk and chunk_len + line_len > 3900:
+            embeds.append(
+                discord.Embed(
+                    title="💰 Баллы участников" + (f" ({page})" if page > 1 else ""),
+                    description="\n".join(chunk),
+                    color=discord.Color(BLACK),
+                )
+            )
+            page += 1
+            chunk = [line]
+            chunk_len = line_len
+        else:
+            chunk.append(line)
+            chunk_len += line_len
 
-    body = (
-        f"**{title}**\n\n"
-        f"**Приз:** {prize_name}\n"
-        f"**Стоимость:** {cost} баллов\n"
-        f"**Статус:** {status}"
+    if chunk:
+        embeds.append(
+            discord.Embed(
+                title="💰 Баллы участников" + (f" ({page})" if page > 1 else ""),
+                description="\n".join(chunk),
+                color=discord.Color(BLACK),
+            )
+        )
+
+    embeds[0].set_footer(
+        text=f"Участников: {len(rows)} · всего баллов: {total_points}"
     )
-    if note:
-        body += f"\n**Комментарий:** {note}"
-    body += f"\n-# {_ts()}"
-    return v2_view(body, accent)
+    return embeds[:10]
 
 
 def order_request_embed(
@@ -347,7 +368,26 @@ async def build_earning_setup_embed(guild: discord.Guild) -> discord.Embed:
     )
     embed.add_field(
         name="👥 Реферал",
-        value=f"{onoff(referral['enabled'])}\n**{referral['param1']}** баллов за друга",
+        value=(
+            f"{onoff(referral['enabled'])}\n"
+            f"Владельцу: **{referral['param1']}** б. · вводящему: **{referral['param3']}** б."
+        ),
+        inline=True,
+    )
+    boost = rules.get("boost", {})
+    twitch_rule = rules.get("twitch", {})
+    telegram_rule = rules.get("telegram", {})
+    embed.add_field(
+        name="🚀 Буст",
+        value=f"{onoff(boost.get('enabled', 0))}\n**{boost.get('param1', 0)}** б. за буст",
+        inline=True,
+    )
+    embed.add_field(
+        name="📺 Twitch / ✈️ TG",
+        value=(
+            f"Twitch: {onoff(twitch_rule.get('enabled', 0))} · **{twitch_rule.get('param1', 0)}** б.\n"
+            f"Telegram: {onoff(telegram_rule.get('enabled', 0))} · **{telegram_rule.get('param1', 0)}** б."
+        ),
         inline=True,
     )
     embed.set_footer(text="Антифлуд: короткие, одинаковые и быстрые сообщения не засчитываются")
@@ -365,9 +405,15 @@ class EarningSetupView(discord.ui.View):
             discord.SelectOption(label="Настроить войс", value="voice", emoji="🎙️"),
             discord.SelectOption(label="Настроить слова", value="words", emoji="💬"),
             discord.SelectOption(label="Настроить реферал", value="referral", emoji="👥"),
+            discord.SelectOption(label="Настроить буст", value="boost", emoji="🚀"),
+            discord.SelectOption(label="Бонус Twitch", value="twitch", emoji="📺"),
+            discord.SelectOption(label="Бонус Telegram", value="telegram", emoji="✈️"),
             discord.SelectOption(label="Вкл/выкл войс", value="toggle_voice", emoji="🔀"),
             discord.SelectOption(label="Вкл/выкл слова", value="toggle_words", emoji="🔀"),
             discord.SelectOption(label="Вкл/выкл реферал", value="toggle_referral", emoji="🔀"),
+            discord.SelectOption(label="Вкл/выкл буст", value="toggle_boost", emoji="🔀"),
+            discord.SelectOption(label="Вкл/выкл Twitch", value="toggle_twitch", emoji="🔀"),
+            discord.SelectOption(label="Вкл/выкл Telegram", value="toggle_telegram", emoji="🔀"),
         ],
     )
     async def action_select(self, interaction: discord.Interaction, select: discord.ui.Select):
@@ -387,6 +433,12 @@ class EarningSetupView(discord.ui.View):
             await interaction.response.send_modal(EditWordsModal())
         elif action == "referral":
             await interaction.response.send_modal(EditReferralModal())
+        elif action == "boost":
+            await interaction.response.send_modal(EditBoostModal())
+        elif action == "twitch":
+            await interaction.response.send_modal(EditSocialBonusModal("twitch", "Twitch"))
+        elif action == "telegram":
+            await interaction.response.send_modal(EditSocialBonusModal("telegram", "Telegram"))
         elif action.startswith("toggle_"):
             key = action.replace("toggle_", "")
             rules = await get_earning_rules(guild_id)
@@ -449,8 +501,8 @@ class EditWordsModal(discord.ui.Modal, title="Настройка слов"):
         )
 
 
-class EditReferralModal(discord.ui.Modal, title="Настройка реферала"):
-    points = discord.ui.TextInput(label="Баллов за друга", default="50", max_length=4)
+class EditBoostModal(discord.ui.Modal, title="Настройка буста"):
+    points = discord.ui.TextInput(label="Баллов за 1 буст", default="250", max_length=5)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild:
@@ -460,8 +512,66 @@ class EditReferralModal(discord.ui.Modal, title="Настройка рефера
             return
         await set_earning_rule(
             interaction.guild.id,
-            "referral",
+            "boost",
             param1=int(self.points.value),
+        )
+        embed = await build_earning_setup_embed(interaction.guild)
+        await interaction.response.send_message(
+            embed=embed,
+            view=EarningSetupView(),
+            ephemeral=True,
+        )
+
+
+class EditSocialBonusModal(discord.ui.Modal):
+    def __init__(self, rule_key: str, title: str):
+        super().__init__(title=f"Бонус {title}")
+        self.rule_key = rule_key
+        self.points = discord.ui.TextInput(label="Баллов (один раз)", default="100", max_length=5)
+        self.add_item(self.points)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        if not self.points.value.isdigit():
+            await interaction.response.send_message("Только числа.", ephemeral=True)
+            return
+        await set_earning_rule(
+            interaction.guild.id,
+            self.rule_key,
+            param1=int(self.points.value),
+        )
+        embed = await build_earning_setup_embed(interaction.guild)
+        await interaction.response.send_message(
+            embed=embed,
+            view=EarningSetupView(),
+            ephemeral=True,
+        )
+
+
+class EditReferralModal(discord.ui.Modal, title="Настройка реферала"):
+    inviter_points = discord.ui.TextInput(
+        label="Баллов владельцу кода",
+        default="50",
+        max_length=4,
+    )
+    invitee_points = discord.ui.TextInput(
+        label="Баллов за ввод кода",
+        default="100",
+        max_length=4,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        if not self.inviter_points.value.isdigit() or not self.invitee_points.value.isdigit():
+            await interaction.response.send_message("Только числа.", ephemeral=True)
+            return
+        await set_earning_rule(
+            interaction.guild.id,
+            "referral",
+            param1=int(self.inviter_points.value),
+            param3=int(self.invitee_points.value),
         )
         embed = await build_earning_setup_embed(interaction.guild)
         await interaction.response.send_message(

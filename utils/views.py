@@ -26,8 +26,10 @@ from config import (
     SHOP_PANEL_TITLE,
     SHOP_PANEL_IMAGE,
     SHOP_SQUAD_INVITE,
+    GIVEAWAY_PANEL_IMAGE,
 )
 from utils.database import get_shop_items, get_earning_rules
+from utils.social_ui import format_social_bonus_earning_lines, social_bonus_enabled
 
 
 def role_panel_embed() -> discord.Embed:
@@ -166,6 +168,10 @@ def load_shop_panel_image() -> tuple[str | None, discord.File | None]:
     return _load_panel_image(SHOP_PANEL_IMAGE)
 
 
+def load_giveaway_panel_image() -> tuple[str | None, discord.File | None]:
+    return _load_panel_image(GIVEAWAY_PANEL_IMAGE)
+
+
 def _shop_item_line(guild: discord.Guild, item: dict, admin: str) -> str:
     role_id = item.get("role_id") or 0
     if role_id:
@@ -199,8 +205,15 @@ async def shop_panel_embed(guild: discord.Guild, image_url: str | None = None) -
         )
     if rules["referral"]["enabled"]:
         earning_lines.append(
-            f"👥 **Реферал (1 человек)** — **{rules['referral']['param1']} баллов**"
+            f"👥 **Ввод рефки** — **{rules['referral']['param3']}** баллов · "
+            f"владельцу **{rules['referral']['param1']}**"
         )
+    boost = rules.get("boost", {})
+    if boost.get("enabled"):
+        earning_lines.append(
+            f"🚀 **Буст сервера** — **{boost['param1']}** баллов за каждый буст"
+        )
+    earning_lines.extend(format_social_bonus_earning_lines(rules))
     earning = "\n".join(earning_lines) if earning_lines else "— правила не настроены"
 
     if items:
@@ -209,6 +222,19 @@ async def shop_panel_embed(guild: discord.Guild, image_url: str | None = None) -
     else:
         prizes_block = "— товаров пока нет"
 
+    usage_lines = [
+        "• Кнопки ниже — баланс, рефералы, покупка",
+        "• **Создать рефку** — заявка в тикет, админ одобрит",
+        f"• **Ввести рефку** — один раз, +**{rules['referral']['param3']}** баллов",
+        "• Слова: флуд и спам не засчитываются",
+    ]
+    if social_bonus_enabled(rules):
+        usage_lines.insert(
+            1,
+            "• **Бонус за подписку** — подпишись на **Twitch** или **Telegram**, "
+            "приложи скрин в тикет (один раз)",
+        )
+
     description = (
         f"__**{SHOP_PANEL_TITLE}**__\n\n"
         f"-- **Начисление баллов**\n"
@@ -216,9 +242,7 @@ async def shop_panel_embed(guild: discord.Guild, image_url: str | None = None) -
         f"-- **Призы**\n"
         f"{prizes_block}\n\n"
         f"-- **Как пользоваться**\n"
-        f"• Кнопки ниже — баланс, рефералы, покупка\n"
-        f"• Реферал: поделись ссылкой — друг заходит на сервер, ты получаешь баллы\n"
-        f"• Слова: флуд и спам не засчитываются"
+        f"{chr(10).join(usage_lines)}"
     )
 
     embed = discord.Embed(description=description, color=discord.Color(BLACK))

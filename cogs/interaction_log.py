@@ -113,11 +113,20 @@ class InteractionLogCog(commands.Cog):
 
         channel = interaction.channel
         channel_str = channel.mention if channel else "—"
-        await log_bot(
-            interaction.guild,
-            f"{_format_command(interaction)}\n"
-            f"{interaction.user.mention} · {channel_str}",
+        asyncio.create_task(
+            self._log_command(interaction, channel_str),
+            name=f"log-cmd-{interaction.id}",
         )
+
+    async def _log_command(self, interaction: discord.Interaction, channel_str: str) -> None:
+        try:
+            await log_bot(
+                interaction.guild,
+                f"{_format_command(interaction)}\n"
+                f"{interaction.user.mention} · {channel_str}",
+            )
+        except Exception:
+            pass
 
 
 async def setup(bot: commands.Bot):

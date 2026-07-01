@@ -22,6 +22,10 @@ COGS = [
     "cogs.setup_shop",
     "cogs.setup_earning",
     "cogs.shop",
+    "cogs.social_bonus",
+    "cogs.referral",
+    "cogs.squad",
+    "cogs.giveaway",
     "cogs.setup_twitch",
     "cogs.setup_logs",
     "cogs.summary",
@@ -149,6 +153,7 @@ class EtvinBot(commands.Bot):
         intents = discord.Intents.default()
         intents.members = True
         intents.guilds = True
+        intents.invites = True
         intents.reactions = True
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)

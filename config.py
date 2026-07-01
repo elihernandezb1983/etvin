@@ -166,12 +166,41 @@ def parse_social_links(raw: str | None = None) -> list[dict]:
 SHOP_PANEL_TITLE = os.getenv("SHOP_PANEL_TITLE", "Информация о Магазине")
 SHOP_PANEL_IMAGE = os.getenv("SHOP_PANEL_IMAGE", "")
 SHOP_SQUAD_INVITE = os.getenv("SHOP_SQUAD_INVITE", "")
+CUSTOM_ROLE_ITEM_KEY = os.getenv("CUSTOM_ROLE_ITEM_KEY", "custom_role")
+LEADERBOARD_REFRESH_MINUTES = _env_int("LEADERBOARD_REFRESH_MINUTES", 1)
+SQUAD_ROLE_KEYWORD = os.getenv("SQUAD_ROLE_KEYWORD", "squad,sqaud,сквад").lower()
+SQUAD_LEADER_ROLE_KEYWORD = os.getenv(
+    "SQUAD_LEADER_ROLE_KEYWORD",
+    "лидер сквад,squad leader,leader squad",
+).lower()
+
+
+def parse_id_list(raw: str | None) -> list[int]:
+    ids: list[int] = []
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.append(int(part))
+    return ids
+
+
+SQUAD_ROLE_IDS = parse_id_list(os.getenv("SQUAD_ROLE_IDS", ""))
+SQUAD_LEADER_ROLE_IDS = parse_id_list(os.getenv("SQUAD_LEADER_ROLE_IDS", ""))
+SQUAD_TRANSFER_COMMISSION_PERCENT = _env_int("SQUAD_TRANSFER_COMMISSION_PERCENT", 10)
 
 SHOP_VOICE_MINUTES = _env_int("SHOP_VOICE_MINUTES", 10)
 SHOP_VOICE_POINTS = _env_int("SHOP_VOICE_POINTS", 10)
 SHOP_WORDS_THRESHOLD = _env_int("SHOP_WORDS_THRESHOLD", 250)
 SHOP_WORDS_POINTS = _env_int("SHOP_WORDS_POINTS", 10)
 SHOP_REFERRAL_POINTS = _env_int("SHOP_REFERRAL_POINTS", 50)
+SHOP_BOOST_POINTS = _env_int("SHOP_BOOST_POINTS", 250)
+SHOP_TWITCH_FOLLOW_POINTS = _env_int("SHOP_TWITCH_FOLLOW_POINTS", 100)
+SHOP_TELEGRAM_JOIN_POINTS = _env_int("SHOP_TELEGRAM_JOIN_POINTS", 100)
+
+# Telegram-бот для проверки подписки на канал (опционально)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")  # @channel или -100...
+TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "")  # без @
 
 # ключ | Название | стоимость | описание [| role_id]
 SHOP_PRIZES = os.getenv(
@@ -202,3 +231,7 @@ def parse_shop_prizes(raw: str | None = None) -> list[dict]:
             "role_id": role_id,
         })
     return prizes
+
+
+# --- Розыгрыши (только баннер в .env, остальное — в Discord) ---
+GIVEAWAY_PANEL_IMAGE = os.getenv("GIVEAWAY_PANEL_IMAGE", "giveaway.png")

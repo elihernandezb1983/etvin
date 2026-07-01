@@ -1,11 +1,20 @@
 import os
+from datetime import date, datetime, timezone
+
 import aiosqlite
+import config
 from config import DB_PATH
+from utils.earning import effective_words
+
+
+def _today_iso() -> str:
+    return date.today().isoformat()
 
 
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
@@ -118,6 +127,33 @@ async def init_db():
                 param3 INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (guild_id, rule_key)
             );
+
+            CREATE TABLE IF NOT EXISTS shop_boost_grants (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                boosts_awarded INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS shop_boost_messages (
+                message_id INTEGER PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS shop_social_claims (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                external_id TEXT,
+                claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, user_id, platform)
+            );
+
+            CREATE TABLE IF NOT EXISTS squads (
+                guild_id INTEGER NOT NULL,
+                role_id INTEGER NOT NULL,
+                leader_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, role_id)
+            );
         """)
         await db.commit()
         async with db.execute("PRAGMA table_info(guild_settings)") as c:
@@ -134,6 +170,10 @@ async def init_db():
             await db.execute("ALTER TABLE guild_settings ADD COLUMN shop_orders_channel_id INTEGER")
         if guild_cols and "shop_ticket_category_id" not in guild_cols:
             await db.execute("ALTER TABLE guild_settings ADD COLUMN shop_ticket_category_id INTEGER")
+        if guild_cols and "giveaway_ticket_cost" not in guild_cols:
+            await db.execute(
+                "ALTER TABLE guild_settings ADD COLUMN giveaway_ticket_cost INTEGER NOT NULL DEFAULT 100"
+            )
         async with db.execute("PRAGMA table_info(shop_points)") as c:
             pts_cols = {row[1] for row in await c.fetchall()}
         if pts_cols and "words_points_today" not in pts_cols:
@@ -160,6 +200,98 @@ async def init_db():
             ref_cols = {row[1] for row in await c.fetchall()}
         if ref_cols and "invite_code" not in ref_cols:
             await db.execute("ALTER TABLE shop_referral_codes ADD COLUMN invite_code TEXT")
+        if ref_cols and "status" not in ref_cols:
+            await db.execute(
+                "ALTER TABLE shop_referral_codes ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"
+            )
+
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS shop_referral_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                requested_code TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                ticket_channel_id INTEGER,
+                message_id INTEGER,
+                resolved_by INTEGER,
+                resolved_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS shop_invite_snapshots (
+                guild_id INTEGER NOT NULL,
+                invite_code TEXT NOT NULL,
+                uses INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, invite_code)
+            );
+
+            CREATE TABLE IF NOT EXISTS raffle_tickets (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                tickets INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS raffles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                prize TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                tickets_per_entry INTEGER NOT NULL DEFAULT 1,
+                winner_count INTEGER NOT NULL DEFAULT 1,
+                winners_json TEXT,
+                total_tickets INTEGER NOT NULL DEFAULT 0,
+                ends_at TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                winner_id INTEGER,
+                channel_id INTEGER,
+                message_id INTEGER,
+                entrants INTEGER NOT NULL DEFAULT 0,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS raffle_entries (
+                raffle_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                tickets_spent INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (raffle_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS shop_social_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                note TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                ticket_channel_id INTEGER,
+                message_id INTEGER,
+                points_awarded INTEGER,
+                resolved_by INTEGER,
+                resolved_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        """)
+        await db.commit()
+        async with db.execute("PRAGMA table_info(raffles)") as c:
+            raffle_cols = {row[1] for row in await c.fetchall()}
+        if raffle_cols and "winner_count" not in raffle_cols:
+            await db.execute("ALTER TABLE raffles ADD COLUMN winner_count INTEGER NOT NULL DEFAULT 1")
+        if raffle_cols and "winners_json" not in raffle_cols:
+            await db.execute("ALTER TABLE raffles ADD COLUMN winners_json TEXT")
+        if raffle_cols and "total_tickets" not in raffle_cols:
+            await db.execute("ALTER TABLE raffles ADD COLUMN total_tickets INTEGER NOT NULL DEFAULT 0")
+        await db.commit()
+        await db.execute(
+            """
+            UPDATE shop_earning_rules
+            SET param3 = 100
+            WHERE rule_key = 'referral' AND param3 = 0
+            """
+        )
         await db.commit()
 
 
@@ -168,6 +300,21 @@ async def _ensure_shop_row(db, guild_id: int, user_id: int):
         "INSERT OR IGNORE INTO shop_points (guild_id, user_id) VALUES (?, ?)",
         (guild_id, user_id),
     )
+
+
+async def _normalize_words_day(db, row: dict) -> dict:
+    today = _today_iso()
+    if row.get("words_day") == today:
+        return row
+    await db.execute(
+        "UPDATE shop_points SET words_points_today = 0, words_day = ? "
+        "WHERE guild_id = ? AND user_id = ?",
+        (today, row["guild_id"], row["user_id"]),
+    )
+    row = dict(row)
+    row["words_points_today"] = 0
+    row["words_day"] = today
+    return row
 
 
 async def get_shop_points(guild_id: int, user_id: int) -> dict:
@@ -180,6 +327,9 @@ async def get_shop_points(guild_id: int, user_id: int) -> dict:
             (guild_id, user_id),
         ) as c:
             row = await c.fetchone()
+        if row:
+            row = await _normalize_words_day(db, dict(row))
+            await db.commit()
     return dict(row) if row else {
         "guild_id": guild_id,
         "user_id": user_id,
@@ -191,15 +341,6 @@ async def get_shop_points(guild_id: int, user_id: int) -> dict:
         "last_message_at": None,
         "last_message_content": None,
     }
-
-
-async def _reset_words_day_if_needed(row: dict) -> dict:
-    today = __import__("datetime").date.today().isoformat()
-    if row.get("words_day") != today:
-        row = dict(row)
-        row["words_points_today"] = 0
-        row["words_day"] = today
-    return row
 
 
 async def update_message_meta(
@@ -243,7 +384,7 @@ async def add_voice_seconds(
     seconds_per_reward: int,
     points_per_reward: int,
 ) -> tuple[int, int]:
-    if seconds <= 0:
+    if seconds <= 0 or seconds_per_reward <= 0 or points_per_reward <= 0:
         row = await get_shop_points(guild_id, user_id)
         return 0, row["points"]
 
@@ -273,21 +414,18 @@ async def add_voice_seconds(
     return awarded, points
 
 
-async def add_message_words(
+async def apply_chat_message(
     guild_id: int,
     user_id: int,
-    words: int,
     *,
+    content: str,
+    at: str,
     words_per_reward: int,
     points_per_reward: int,
     daily_cap: int,
 ) -> tuple[int, int]:
-    if words <= 0:
-        row = await get_shop_points(guild_id, user_id)
-        return 0, row["points"]
-
-    today = __import__("datetime").date.today().isoformat()
-
+    """Считает слова, обновляет антиспам-мету и начисляет баллы в одной транзакции."""
+    now = datetime.now(timezone.utc)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         await _ensure_shop_row(db, guild_id, user_id)
@@ -297,40 +435,103 @@ async def add_message_words(
             (guild_id, user_id),
         ) as c:
             row = await c.fetchone()
-        row = dict(row)
+        row = await _normalize_words_day(db, dict(row))
 
-        if row.get("words_day") != today:
-            row["words_points_today"] = 0
-            row["words_day"] = today
+        counted_words = effective_words(
+            content,
+            row.get("last_message_content"),
+            row.get("last_message_at"),
+            now,
+        )
 
-        remaining_cap = max(0, daily_cap - row["words_points_today"])
-        if remaining_cap <= 0:
-            return 0, row["points"]
-
-        word_buffer = row["word_buffer"] + words
         points = row["points"]
+        word_buffer = row["word_buffer"]
         awarded = 0
-        while word_buffer >= words_per_reward and awarded + points_per_reward <= remaining_cap:
-            word_buffer -= words_per_reward
-            points += points_per_reward
-            awarded += points_per_reward
-            row["words_points_today"] += points_per_reward
+
+        if (
+            counted_words > 0
+            and words_per_reward > 0
+            and points_per_reward > 0
+        ):
+            word_buffer += counted_words
+            if daily_cap <= 0:
+                remaining_cap = None
+            else:
+                remaining_cap = max(0, daily_cap - row["words_points_today"])
+
+            if remaining_cap is None or remaining_cap > 0:
+                while word_buffer >= words_per_reward:
+                    if remaining_cap is not None and awarded + points_per_reward > remaining_cap:
+                        break
+                    word_buffer -= words_per_reward
+                    points += points_per_reward
+                    awarded += points_per_reward
+                    row["words_points_today"] += points_per_reward
 
         await db.execute(
             "UPDATE shop_points SET points = ?, word_buffer = ?, voice_buffer = ?, "
-            "words_points_today = ?, words_day = ? WHERE guild_id = ? AND user_id = ?",
+            "words_points_today = ?, words_day = ?, last_message_at = ?, last_message_content = ? "
+            "WHERE guild_id = ? AND user_id = ?",
             (
                 points,
                 word_buffer,
                 row["voice_buffer"],
                 row["words_points_today"],
                 row["words_day"],
+                at,
+                content[:500],
                 guild_id,
                 user_id,
             ),
         )
         await db.commit()
     return awarded, points
+
+
+async def transfer_shop_points(
+    guild_id: int,
+    from_user_id: int,
+    to_user_id: int,
+    amount: int,
+    *,
+    commission_percent: int = 10,
+) -> tuple[bool, str, int]:
+    if amount <= 0:
+        return False, "Сумма должна быть больше нуля.", 0
+    if from_user_id == to_user_id:
+        return False, "Нельзя перевести баллы себе.", 0
+
+    commission = amount * commission_percent // 100
+    received = amount - commission
+    if received <= 0:
+        return False, "Слишком маленькая сумма после комиссии.", 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await _ensure_shop_row(db, guild_id, from_user_id)
+        await _ensure_shop_row(db, guild_id, to_user_id)
+        await db.commit()
+        async with db.execute(
+            "SELECT points FROM shop_points WHERE guild_id = ? AND user_id = ?",
+            (guild_id, from_user_id),
+        ) as c:
+            row = await c.fetchone()
+        if row["points"] < amount:
+            return (
+                False,
+                f"Не хватает баллов. Нужно **{amount}**, у тебя **{row['points']}**.",
+                0,
+            )
+        await db.execute(
+            "UPDATE shop_points SET points = points - ? WHERE guild_id = ? AND user_id = ?",
+            (amount, guild_id, from_user_id),
+        )
+        await db.execute(
+            "UPDATE shop_points SET points = points + ? WHERE guild_id = ? AND user_id = ?",
+            (received, guild_id, to_user_id),
+        )
+        await db.commit()
+    return True, "", received
 
 
 async def adjust_shop_points(guild_id: int, user_id: int, delta: int) -> int:
@@ -350,6 +551,285 @@ async def adjust_shop_points(guild_id: int, user_id: int, delta: int) -> int:
         )
         await db.commit()
     return new_points
+
+
+async def get_boost_awarded_count(guild_id: int, user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT boosts_awarded FROM shop_boost_grants "
+            "WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ) as c:
+            row = await c.fetchone()
+    return row[0] if row else 0
+
+
+async def set_boost_awarded_count(guild_id: int, user_id: int, count: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO shop_boost_grants (guild_id, user_id, boosts_awarded) "
+            "VALUES (?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET boosts_awarded = ?",
+            (guild_id, user_id, count, count),
+        )
+        await db.commit()
+
+
+async def mark_boost_message_processed(message_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO shop_boost_messages (message_id) VALUES (?)",
+                (message_id,),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def award_boost_points(guild_id: int, user_id: int, total_boosts: int) -> int:
+    rules = await get_earning_rules(guild_id)
+    boost_rule = rules.get("boost", {})
+    if not boost_rule.get("enabled"):
+        return 0
+    points_per = boost_rule.get("param1", 0)
+    if points_per <= 0 or total_boosts <= 0:
+        return 0
+
+    paid = await get_boost_awarded_count(guild_id, user_id)
+    delta = max(0, total_boosts - paid)
+    if delta <= 0:
+        return 0
+
+    await set_boost_awarded_count(guild_id, user_id, paid + delta)
+    awarded = delta * points_per
+    await adjust_shop_points(guild_id, user_id, awarded)
+    return awarded
+
+
+async def has_social_bonus(guild_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM shop_social_claims WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ) as c:
+            return await c.fetchone() is not None
+
+
+async def has_social_claim(guild_id: int, user_id: int, platform: str) -> bool:
+    if platform == "bonus":
+        return await has_social_bonus(guild_id, user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM shop_social_claims "
+            "WHERE guild_id = ? AND user_id = ? AND platform = ?",
+            (guild_id, user_id, platform),
+        ) as c:
+            return await c.fetchone() is not None
+
+
+async def external_id_claimed(guild_id: int, platform: str, external_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM shop_social_claims "
+            "WHERE guild_id = ? AND platform = ? AND external_id = ?",
+            (guild_id, platform, external_id),
+        ) as c:
+            return await c.fetchone() is not None
+
+
+async def claim_social_bonus(
+    guild_id: int,
+    user_id: int,
+    platform: str,
+    *,
+    external_id: str | None = None,
+) -> int:
+    rules = await get_earning_rules(guild_id)
+    rule = rules.get(platform, {})
+    if not rule.get("enabled"):
+        return 0
+    if await has_social_claim(guild_id, user_id, platform):
+        return 0
+    if external_id and await external_id_claimed(guild_id, platform, external_id):
+        return 0
+
+    points = rule.get("param1", 0)
+    if points <= 0:
+        return 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO shop_social_claims (guild_id, user_id, platform, external_id) "
+                "VALUES (?, ?, ?, ?)",
+                (guild_id, user_id, platform, external_id),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            return 0
+
+    await adjust_shop_points(guild_id, user_id, points)
+    return points
+
+
+async def get_pending_social_request(guild_id: int, user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM shop_social_requests
+            WHERE guild_id = ? AND user_id = ? AND status = 'pending'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (guild_id, user_id),
+        ) as c:
+            row = await c.fetchone()
+    return dict(row) if row else None
+
+
+async def create_social_request(
+    guild_id: int,
+    user_id: int,
+    *,
+    ticket_channel_id: int,
+) -> tuple[bool, str, int | None]:
+    if await has_social_bonus(guild_id, user_id):
+        return False, "Ты уже получал бонус за подписку.", None
+    if await get_pending_social_request(guild_id, user_id):
+        return False, "Заявка уже на рассмотрении.", None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO shop_social_requests (
+                guild_id, user_id, platform, ticket_channel_id
+            ) VALUES (?, ?, 'bonus', ?)
+            """,
+            (guild_id, user_id, ticket_channel_id),
+        )
+        await db.commit()
+        return True, "Заявка создана.", cursor.lastrowid
+
+
+async def set_social_request_message(request_id: int, message_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE shop_social_requests SET message_id = ? WHERE id = ?",
+            (message_id, request_id),
+        )
+        await db.commit()
+
+
+async def get_social_request(request_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM shop_social_requests WHERE id = ?",
+            (request_id,),
+        ) as c:
+            row = await c.fetchone()
+    return dict(row) if row else None
+
+
+async def get_pending_social_requests() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM shop_social_requests
+            WHERE status = 'pending' AND message_id IS NOT NULL
+            """,
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def approve_social_request(
+    request_id: int,
+    *,
+    admin_id: int,
+    points: int,
+) -> tuple[bool, str, dict | None]:
+    if points <= 0:
+        return False, "Баллы должны быть больше нуля.", None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM shop_social_requests WHERE id = ?",
+            (request_id,),
+        ) as c:
+            req = await c.fetchone()
+        if not req:
+            return False, "Заявка не найдена.", None
+        if req["status"] != "pending":
+            return False, "Заявка уже обработана.", None
+
+        guild_id = req["guild_id"]
+        user_id = req["user_id"]
+
+        async with db.execute(
+            "SELECT 1 FROM shop_social_claims WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ) as c:
+            if await c.fetchone():
+                return False, "Пользователь уже получал бонус.", dict(req)
+
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            await db.execute(
+                """
+                INSERT INTO shop_social_claims (guild_id, user_id, platform, external_id)
+                VALUES (?, ?, 'bonus', NULL)
+                """,
+                (guild_id, user_id),
+            )
+        except aiosqlite.IntegrityError:
+            return False, "Бонус уже получен.", dict(req)
+
+        await db.execute(
+            """
+            UPDATE shop_social_requests
+            SET status = 'approved', points_awarded = ?, resolved_by = ?, resolved_at = ?
+            WHERE id = ?
+            """,
+            (points, admin_id, now, request_id),
+        )
+        await db.commit()
+
+    await adjust_shop_points(guild_id, user_id, points)
+    return True, f"Начислено **{points}** баллов.", dict(req)
+
+
+async def reject_social_request(
+    request_id: int,
+    *,
+    admin_id: int,
+) -> tuple[bool, str, dict | None]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM shop_social_requests WHERE id = ?",
+            (request_id,),
+        ) as c:
+            req = await c.fetchone()
+        if not req:
+            return False, "Заявка не найдена.", None
+        if req["status"] != "pending":
+            return False, "Заявка уже обработана.", None
+
+        now = datetime.now(timezone.utc).isoformat()
+        await db.execute(
+            """
+            UPDATE shop_social_requests
+            SET status = 'rejected', resolved_by = ?, resolved_at = ?
+            WHERE id = ?
+            """,
+            (admin_id, now, request_id),
+        )
+        await db.commit()
+        return True, "Заявка отклонена.", dict(req)
 
 
 async def spend_shop_points(guild_id: int, user_id: int, amount: int) -> bool:
@@ -372,37 +852,40 @@ async def spend_shop_points(guild_id: int, user_id: int, amount: int) -> bool:
     return True
 
 
-async def get_or_create_referral_code(guild_id: int, user_id: int) -> str:
-    import secrets
-    import string
+def normalize_referral_code(code: str) -> str:
+    import re
 
+    return re.sub(r"[^A-Z0-9_]", "", code.strip().upper())[:20]
+
+
+async def get_user_referral_code(guild_id: int, user_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT code FROM shop_referral_codes WHERE guild_id = ? AND user_id = ?",
+            "SELECT * FROM shop_referral_codes WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
         ) as c:
             row = await c.fetchone()
-        if row:
-            return row["code"]
-
-        alphabet = string.ascii_uppercase + string.digits
-        for _ in range(20):
-            code = "".join(secrets.choice(alphabet) for _ in range(8))
-            try:
-                await db.execute(
-                    "INSERT INTO shop_referral_codes (guild_id, user_id, code) VALUES (?, ?, ?)",
-                    (guild_id, user_id, code),
-                )
-                await db.commit()
-                return code
-            except aiosqlite.IntegrityError:
-                continue
-    raise RuntimeError("Не удалось создать реф-код")
+    return dict(row) if row else None
 
 
-async def get_referral_inviter(guild_id: int, code: str) -> int | None:
-    code = code.strip().upper()
+async def get_pending_referral_request(guild_id: int, user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM shop_referral_requests
+            WHERE guild_id = ? AND user_id = ? AND status = 'pending'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (guild_id, user_id),
+        ) as c:
+            row = await c.fetchone()
+    return dict(row) if row else None
+
+
+async def referral_code_taken(guild_id: int, code: str, *, exclude_user_id: int | None = None) -> bool:
+    code = normalize_referral_code(code)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -410,27 +893,390 @@ async def get_referral_inviter(guild_id: int, code: str) -> int | None:
             (guild_id, code),
         ) as c:
             row = await c.fetchone()
-    return row["user_id"] if row else None
+        if row and row["user_id"] != exclude_user_id:
+            return True
+        async with db.execute(
+            """
+            SELECT user_id FROM shop_referral_requests
+            WHERE guild_id = ? AND requested_code = ? AND status = 'pending'
+            """,
+            (guild_id, code),
+        ) as c:
+            pending = await c.fetchone()
+    return bool(pending and pending["user_id"] != exclude_user_id)
 
 
-async def get_referral_invite_code(guild_id: int, user_id: int) -> str | None:
+async def validate_referral_request(guild_id: int, user_id: int, code: str) -> tuple[bool, str, str]:
+    normalized = normalize_referral_code(code)
+    if len(normalized) < 3:
+        return False, "Код — минимум **3** символа (латиница, цифры, `_`).", normalized
+    if await get_user_referral_code(guild_id, user_id):
+        return False, "У тебя уже есть реферальный код.", normalized
+    if await get_pending_referral_request(guild_id, user_id):
+        return False, "Заявка уже на рассмотрении — жди ответа в тикете.", normalized
+    if await referral_code_taken(guild_id, normalized):
+        return False, f"Код **{normalized}** уже занят.", normalized
+    return True, "", normalized
+
+
+async def create_referral_request(
+    guild_id: int,
+    user_id: int,
+    code: str,
+    *,
+    ticket_channel_id: int,
+) -> tuple[bool, str, int | None]:
+    ok, msg, normalized = await validate_referral_request(guild_id, user_id, code)
+    if not ok:
+        return False, msg, None
+    code = normalized
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO shop_referral_requests (
+                guild_id, user_id, requested_code, ticket_channel_id
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (guild_id, user_id, code, ticket_channel_id),
+        )
+        await db.commit()
+        return True, "Заявка создана.", cursor.lastrowid
+
+
+async def set_referral_request_message(request_id: int, message_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE shop_referral_requests SET message_id = ? WHERE id = ?",
+            (message_id, request_id),
+        )
+        await db.commit()
+
+
+async def get_referral_request(request_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT invite_code FROM shop_referral_codes WHERE guild_id = ? AND user_id = ?",
+            "SELECT * FROM shop_referral_requests WHERE id = ?",
+            (request_id,),
+        ) as c:
+            row = await c.fetchone()
+    return dict(row) if row else None
+
+
+async def get_pending_referral_requests() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM shop_referral_requests WHERE status = 'pending' AND message_id IS NOT NULL",
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def resolve_referral_request(
+    request_id: int,
+    *,
+    approved: bool,
+    admin_id: int,
+) -> tuple[bool, str, dict | None]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM shop_referral_requests WHERE id = ?",
+            (request_id,),
+        ) as c:
+            req = await c.fetchone()
+        if not req:
+            return False, "Заявка не найдена.", None
+        if req["status"] != "pending":
+            return False, "Заявка уже обработана.", None
+
+        now = datetime.now(timezone.utc).isoformat()
+        if not approved:
+            await db.execute(
+                """
+                UPDATE shop_referral_requests
+                SET status = 'rejected', resolved_by = ?, resolved_at = ?
+                WHERE id = ?
+                """,
+                (admin_id, now, request_id),
+            )
+            await db.commit()
+            return True, "Заявка отклонена.", dict(req)
+
+        async with db.execute(
+            "SELECT 1 FROM shop_referral_codes WHERE guild_id = ? AND user_id = ?",
+            (req["guild_id"], req["user_id"]),
+        ) as c:
+            if await c.fetchone():
+                return False, "У пользователя уже есть код.", dict(req)
+
+        try:
+            await db.execute(
+                """
+                INSERT INTO shop_referral_codes (guild_id, user_id, code, status)
+                VALUES (?, ?, ?, 'approved')
+                """,
+                (req["guild_id"], req["user_id"], req["requested_code"]),
+            )
+        except aiosqlite.IntegrityError:
+            return False, "Этот код уже занят.", dict(req)
+
+        await db.execute(
+            """
+            UPDATE shop_referral_requests
+            SET status = 'approved', resolved_by = ?, resolved_at = ?
+            WHERE id = ?
+            """,
+            (admin_id, now, request_id),
+        )
+        await db.commit()
+        return True, f"Код **{req['requested_code']}** одобрен.", dict(req)
+
+
+async def get_referral_inviter(guild_id: int, code: str) -> int | None:
+    code = normalize_referral_code(code)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT user_id FROM shop_referral_codes
+            WHERE guild_id = ? AND code = ? AND status = 'approved'
+            """,
+            (guild_id, code),
+        ) as c:
+            row = await c.fetchone()
+    return row["user_id"] if row else None
+
+
+async def admin_set_referral_code(
+    guild_id: int,
+    user_id: int,
+    code: str,
+) -> tuple[bool, str]:
+    code = normalize_referral_code(code)
+    if len(code) < 3:
+        return False, "Код — минимум **3** символа."
+    if await referral_code_taken(guild_id, code, exclude_user_id=user_id):
+        return False, f"Код **{code}** уже занят."
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM shop_referral_codes WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ) as c:
+            exists = await c.fetchone()
+        if exists:
+            await db.execute(
+                "UPDATE shop_referral_codes SET code = ?, status = 'approved' "
+                "WHERE guild_id = ? AND user_id = ?",
+                (code, guild_id, user_id),
+            )
+        else:
+            await db.execute(
+                """
+                INSERT INTO shop_referral_codes (guild_id, user_id, code, status)
+                VALUES (?, ?, ?, 'approved')
+                """,
+                (guild_id, user_id, code),
+            )
+        await db.execute(
+            """
+            UPDATE shop_referral_requests
+            SET status = 'rejected', resolved_at = datetime('now')
+            WHERE guild_id = ? AND user_id = ? AND status = 'pending'
+            """,
+            (guild_id, user_id),
+        )
+        await db.commit()
+    return True, f"Код **{code}** выдан."
+
+
+async def admin_delete_referral_code(guild_id: int, user_id: int) -> tuple[bool, str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT code FROM shop_referral_codes WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
         ) as c:
             row = await c.fetchone()
-    if row and row["invite_code"]:
-        return row["invite_code"]
-    return None
+        if not row:
+            return False, "У пользователя нет реферального кода."
+        await db.execute(
+            "DELETE FROM shop_referral_codes WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        await db.commit()
+    return True, f"Код **{row[0]}** удалён."
 
 
-async def set_referral_invite_code(guild_id: int, user_id: int, invite_code: str) -> None:
+async def get_user_referrer(guild_id: int, user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT r.inviter_id, c.code
+            FROM shop_referrals r
+            LEFT JOIN shop_referral_codes c
+              ON c.guild_id = r.guild_id AND c.user_id = r.inviter_id
+            WHERE r.guild_id = ? AND r.invited_id = ?
+            """,
+            (guild_id, user_id),
+        ) as c:
+            row = await c.fetchone()
+    return dict(row) if row else None
+
+
+async def apply_referral_code(
+    guild_id: int,
+    user_id: int,
+    code: str,
+    *,
+    inviter_points: int,
+    invitee_points: int,
+) -> tuple[bool, str, int | None]:
+    code = normalize_referral_code(code)
+    inviter_id = await get_referral_inviter(guild_id, code)
+    if not inviter_id:
+        return False, "Код не найден или ещё не одобрен.", None
+    if inviter_id == user_id:
+        return False, "Нельзя ввести свою рефку.", None
+    if await referral_already_used(guild_id, user_id):
+        return False, "Ты уже вводил реферальный код.", None
+    if not await register_referral(guild_id, inviter_id, user_id):
+        return False, "Не удалось применить код.", None
+
+    await adjust_shop_points(guild_id, user_id, invitee_points)
+    await adjust_shop_points(guild_id, inviter_id, inviter_points)
+    return True, (
+        f"✅ Код **{code}** принят!\n"
+        f"+**{invitee_points}** баллов тебе · +**{inviter_points}** владельцу кода."
+    ), inviter_id
+
+
+async def get_points_leaderboard(guild_id: int, limit: int = 15) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT user_id, points FROM shop_points
+            WHERE guild_id = ? AND points > 0
+            ORDER BY points DESC, user_id ASC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_all_shop_points(guild_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT user_id, points FROM shop_points
+            WHERE guild_id = ? AND points > 0
+            ORDER BY points DESC, user_id ASC
+            """,
+            (guild_id,),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_referrals_leaderboard(guild_id: int, limit: int = 15) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT inviter_id AS user_id, COUNT(*) AS referral_count
+            FROM shop_referrals
+            WHERE guild_id = ?
+            GROUP BY inviter_id
+            ORDER BY referral_count DESC, inviter_id ASC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_all_referral_codes(guild_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT user_id, code, status
+            FROM shop_referral_codes
+            WHERE guild_id = ?
+            ORDER BY code ASC, user_id ASC
+            """,
+            (guild_id,),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_custom_role_leaders(guild_id: int, item_key: str) -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT DISTINCT user_id FROM shop_redemptions
+            WHERE guild_id = ? AND status = 'accepted' AND prize_key = ?
+            ORDER BY user_id ASC
+            """,
+            (guild_id, item_key),
+        ) as c:
+            rows = await c.fetchall()
+    return [row[0] for row in rows]
+
+
+async def get_squads(guild_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT role_id, leader_id FROM squads WHERE guild_id = ? ORDER BY role_id ASC",
+            (guild_id,),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def upsert_squad(guild_id: int, role_id: int, leader_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE shop_referral_codes SET invite_code = ? WHERE guild_id = ? AND user_id = ?",
-            (invite_code, guild_id, user_id),
+            """
+            INSERT INTO squads (guild_id, role_id, leader_id) VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, role_id) DO UPDATE SET leader_id = excluded.leader_id
+            """,
+            (guild_id, role_id, leader_id),
+        )
+        await db.commit()
+
+
+async def get_invite_snapshot(guild_id: int) -> dict[str, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT invite_code, uses FROM shop_invite_snapshots WHERE guild_id = ?",
+            (guild_id,),
+        ) as c:
+            rows = await c.fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+async def save_invite_snapshot(guild_id: int, snapshot: dict[str, int]) -> None:
+    if not snapshot:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            """
+            INSERT INTO shop_invite_snapshots (guild_id, invite_code, uses)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, invite_code) DO UPDATE SET uses = excluded.uses
+            """,
+            [(guild_id, code, uses) for code, uses in snapshot.items()],
         )
         await db.commit()
 
@@ -500,7 +1346,10 @@ async def create_shop_redemption(
 _DEFAULT_EARNING = {
     "voice": {"enabled": 1, "param1": 10, "param2": 10, "param3": 0},
     "words": {"enabled": 1, "param1": 250, "param2": 10, "param3": 100},
-    "referral": {"enabled": 1, "param1": 50, "param2": 0, "param3": 0},
+    "referral": {"enabled": 1, "param1": 50, "param2": 0, "param3": 100},
+    "boost": {"enabled": 1, "param1": config.SHOP_BOOST_POINTS, "param2": 0, "param3": 0},
+    "twitch": {"enabled": 1, "param1": config.SHOP_TWITCH_FOLLOW_POINTS, "param2": 0, "param3": 0},
+    "telegram": {"enabled": 1, "param1": config.SHOP_TELEGRAM_JOIN_POINTS, "param2": 0, "param3": 0},
 }
 
 
@@ -931,3 +1780,332 @@ async def mark_twitch_announced(alert_id: int, started_at: str, announced_at: st
             (started_at, announced_at, alert_id),
         )
         await db.commit()
+
+
+# --- Розыгрыши ---
+
+
+async def get_giveaway_ticket_cost(guild_id: int) -> int:
+    settings = await get_settings(guild_id)
+    cost = settings.get("giveaway_ticket_cost") or 100
+    return max(1, int(cost))
+
+
+async def get_ticket_balance(guild_id: int, user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT tickets FROM raffle_tickets WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ) as c:
+            row = await c.fetchone()
+    return row["tickets"] if row else 0
+
+
+async def buy_raffle_tickets(
+    guild_id: int,
+    user_id: int,
+    quantity: int,
+    cost_per_ticket: int,
+) -> tuple[bool, str, int]:
+    if quantity <= 0:
+        return False, "Укажи количество больше нуля.", 0
+    total_cost = quantity * cost_per_ticket
+    if not await spend_shop_points(guild_id, user_id, total_cost):
+        return False, f"Не хватает баллов. Нужно **{total_cost}**.", 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO raffle_tickets (guild_id, user_id, tickets) VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET tickets = tickets + ?",
+            (guild_id, user_id, quantity, quantity),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT tickets FROM raffle_tickets WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ) as c:
+            row = await c.fetchone()
+    balance = row[0] if row else quantity
+    return True, f"✅ Куплено **{quantity}** билет(ов) за **{total_cost}** баллов.", balance
+
+
+async def create_raffle(
+    guild_id: int,
+    *,
+    title: str,
+    prize: str,
+    description: str,
+    winner_count: int,
+    ends_at: str | None,
+    created_by: int,
+    channel_id: int,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO raffles (
+                guild_id, title, prize, description, winner_count,
+                ends_at, created_by, channel_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                title,
+                prize,
+                description,
+                max(1, winner_count),
+                ends_at,
+                created_by,
+                channel_id,
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def set_raffle_message(raffle_id: int, message_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE raffles SET message_id = ? WHERE id = ?",
+            (message_id, raffle_id),
+        )
+        await db.commit()
+
+
+async def get_raffle(raffle_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM raffles WHERE id = ?", (raffle_id,)) as c:
+            row = await c.fetchone()
+    return dict(row) if row else None
+
+
+async def get_active_raffles(guild_id: int) -> list[dict]:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM raffles
+            WHERE guild_id = ? AND status = 'active'
+              AND (ends_at IS NULL OR ends_at > ?)
+            ORDER BY id DESC
+            """,
+            (guild_id, now),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_persisted_active_raffles() -> list[dict]:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM raffles
+            WHERE status = 'active' AND message_id IS NOT NULL
+              AND (ends_at IS NULL OR ends_at > ?)
+            """,
+            (now,),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_raffle_entry(raffle_id: int, user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM raffle_entries WHERE raffle_id = ? AND user_id = ?",
+            (raffle_id, user_id),
+        ) as c:
+            row = await c.fetchone()
+    return dict(row) if row else None
+
+
+async def enter_raffle(raffle_id: int, user_id: int, tickets: int) -> tuple[bool, str]:
+    if tickets < 1:
+        return False, "Нужно потратить хотя бы **1** билет."
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM raffles WHERE id = ?", (raffle_id,)) as c:
+            raffle = await c.fetchone()
+        if not raffle:
+            return False, "Розыгрыш не найден."
+        if raffle["status"] != "active":
+            return False, "Розыгрыш уже завершён."
+        if user_id == raffle["created_by"]:
+            return False, "Организатор розыгрыша не может участвовать."
+        if raffle["ends_at"]:
+            try:
+                ends = datetime.fromisoformat(raffle["ends_at"])
+                if ends.tzinfo is None:
+                    ends = ends.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) >= ends:
+                    return False, "Время участия истекло."
+            except ValueError:
+                pass
+
+        async with db.execute(
+            "SELECT tickets FROM raffle_tickets WHERE guild_id = ? AND user_id = ?",
+            (raffle["guild_id"], user_id),
+        ) as c:
+            row = await c.fetchone()
+        balance = row["tickets"] if row else 0
+        if balance < tickets:
+            return False, (
+                f"Нужно **{tickets}** билет(ов), у тебя **{balance}**. "
+                f"Купи билеты на панели розыгрышей."
+            )
+
+        async with db.execute(
+            "SELECT tickets_spent FROM raffle_entries WHERE raffle_id = ? AND user_id = ?",
+            (raffle_id, user_id),
+        ) as c:
+            existing = await c.fetchone()
+
+        await db.execute(
+            "UPDATE raffle_tickets SET tickets = tickets - ? "
+            "WHERE guild_id = ? AND user_id = ?",
+            (tickets, raffle["guild_id"], user_id),
+        )
+
+        if existing:
+            new_spent = existing["tickets_spent"] + tickets
+            await db.execute(
+                "UPDATE raffle_entries SET tickets_spent = ? "
+                "WHERE raffle_id = ? AND user_id = ?",
+                (new_spent, raffle_id, user_id),
+            )
+            msg = f"🎟 Добавлено **{tickets}** билет(ов)! Всего в розыгрыше: **{new_spent}**."
+        else:
+            await db.execute(
+                "INSERT INTO raffle_entries (raffle_id, user_id, tickets_spent) VALUES (?, ?, ?)",
+                (raffle_id, user_id, tickets),
+            )
+            await db.execute(
+                "UPDATE raffles SET entrants = entrants + 1 WHERE id = ?",
+                (raffle_id,),
+            )
+            msg = f"🎉 Ты в розыгрыше с **{tickets}** билет(ами)! Чем больше билетов — тем выше шанс."
+
+        await db.execute(
+            "UPDATE raffles SET total_tickets = total_tickets + ? WHERE id = ?",
+            (tickets, raffle_id),
+        )
+        await db.commit()
+    return True, msg
+
+
+async def get_raffle_entries(raffle_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM raffle_entries WHERE raffle_id = ? ORDER BY created_at",
+            (raffle_id,),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def draw_raffle_winners(raffle_id: int) -> tuple[bool, str, list[int]]:
+    import json
+    import random
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM raffles WHERE id = ?", (raffle_id,)) as c:
+            raffle = await c.fetchone()
+        if not raffle:
+            return False, "Розыгрыш не найден.", []
+        if raffle["status"] != "active":
+            return False, "Розыгрыш уже завершён.", []
+
+        async with db.execute(
+            "SELECT user_id, tickets_spent FROM raffle_entries WHERE raffle_id = ?",
+            (raffle_id,),
+        ) as c:
+            rows = await c.fetchall()
+        if not rows:
+            return False, "Нет участников.", []
+
+        pool = [
+            (row["user_id"], row["tickets_spent"])
+            for row in rows
+            if row["user_id"] != raffle["created_by"]
+        ]
+        if not pool:
+            return False, "Нет участников (организатор исключён).", []
+        winner_count = max(1, raffle["winner_count"] or 1)
+        winners: list[int] = []
+
+        for _ in range(min(winner_count, len(pool))):
+            users = [user_id for user_id, _ in pool]
+            weights = [weight for _, weight in pool]
+            winner = random.choices(users, weights=weights, k=1)[0]
+            winners.append(winner)
+            pool = [(user_id, weight) for user_id, weight in pool if user_id != winner]
+
+        await db.execute(
+            "UPDATE raffles SET status = 'ended', winner_id = ?, winners_json = ? WHERE id = ?",
+            (winners[0], json.dumps(winners), raffle_id),
+        )
+        await db.commit()
+    return True, "Победители выбраны.", winners
+
+
+async def cancel_raffle(raffle_id: int) -> tuple[bool, str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM raffles WHERE id = ?", (raffle_id,)) as c:
+            raffle = await c.fetchone()
+        if not raffle:
+            return False, "Розыгрыш не найден."
+        if raffle["status"] != "active":
+            return False, "Розыгрыш уже завершён."
+
+        async with db.execute(
+            "SELECT user_id, tickets_spent FROM raffle_entries WHERE raffle_id = ?",
+            (raffle_id,),
+        ) as c:
+            entries = await c.fetchall()
+
+        for entry in entries:
+            await db.execute(
+                "INSERT INTO raffle_tickets (guild_id, user_id, tickets) VALUES (?, ?, ?) "
+                "ON CONFLICT(guild_id, user_id) DO UPDATE SET tickets = tickets + ?",
+                (
+                    raffle["guild_id"],
+                    entry["user_id"],
+                    entry["tickets_spent"],
+                    entry["tickets_spent"],
+                ),
+            )
+
+        await db.execute("DELETE FROM raffle_entries WHERE raffle_id = ?", (raffle_id,))
+        await db.execute(
+            "UPDATE raffles SET status = 'cancelled', entrants = 0, total_tickets = 0 WHERE id = ?",
+            (raffle_id,),
+        )
+        await db.commit()
+    return True, "Розыгрыш отменён, билеты возвращены участникам."
+
+
+async def get_user_raffle_entries(guild_id: int, user_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT e.*, r.title, r.prize, r.status
+            FROM raffle_entries e
+            JOIN raffles r ON r.id = e.raffle_id
+            WHERE r.guild_id = ? AND e.user_id = ?
+            ORDER BY e.created_at DESC
+            """,
+            (guild_id, user_id),
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]

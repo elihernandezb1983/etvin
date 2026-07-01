@@ -1,8 +1,11 @@
+import asyncio
 import logging
 import re
+import unicodedata
 from datetime import datetime, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from utils.database import (
@@ -11,34 +14,57 @@ from utils.database import (
     get_settings,
     get_earning_rules,
     add_voice_seconds,
-    add_message_words,
+    apply_chat_message,
     adjust_shop_points,
     spend_shop_points,
-    get_or_create_referral_code,
-    get_referral_invite_code,
-    set_referral_invite_code,
-    get_referral_inviter_by_invite,
-    register_referral,
-    referral_already_used,
     get_referral_count,
+    get_user_referrer,
     create_shop_redemption,
     set_redemption_message_id,
     set_redemption_ticket_channel,
     resolve_redemption,
     get_pending_redemptions,
-    update_message_meta,
+    award_boost_points,
+    mark_boost_message_processed,
+    get_all_shop_points,
 )
 from utils.discord_log import log_server
+from utils.permissions import admin_only
 from utils.shop_tickets import create_shop_ticket, remove_buyer_from_ticket
 from utils.shop_ui import (
     order_request_embed,
-    verdict_dm_view,
     OrderDecisionView,
-    CloseTicketView,
+    build_admin_points_embeds,
+)
+from utils.referral_ui import (
+    build_my_referrals_embed,
+    EnterReferralModal,
+    CreateReferralModal,
 )
 
 log = logging.getLogger("etvin")
-_WORD_RE = re.compile(r"\S+")
+
+_BOOST_MESSAGE_TYPES = {
+    discord.MessageType.premium_guild_subscription,
+    discord.MessageType.premium_guild_tier_1,
+    discord.MessageType.premium_guild_tier_2,
+    discord.MessageType.premium_guild_tier_3,
+}
+_AFK_LABEL_RE = re.compile(r"afk|а\s*ф\s*к", re.IGNORECASE)
+
+
+def _fold_channel_text(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
+def _text_looks_afk(text: str | None) -> bool:
+    if not text:
+        return False
+    folded = _fold_channel_text(text)
+    if _AFK_LABEL_RE.search(folded):
+        return True
+    letters = re.sub(r"[^a-zа-яё]", "", folded)
+    return "afk" in letters or "афк" in letters
 
 
 class ShopBuySelect(discord.ui.Select):
@@ -72,6 +98,36 @@ class ShopBuyView(discord.ui.View):
         self.add_item(ShopBuySelect(items))
 
 
+class LiveBalanceView(discord.ui.View):
+    REFRESH_SECONDS = 5
+    PANEL_TIMEOUT = 300
+
+    def __init__(self, cog: "ShopCog", guild_id: int, user_id: int):
+        super().__init__(timeout=self.PANEL_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self._refresh_task: asyncio.Task | None = None
+
+    def start_refresh(self, interaction: discord.Interaction) -> None:
+        self._refresh_task = asyncio.create_task(self._refresh_loop(interaction))
+
+    async def _refresh_loop(self, interaction: discord.Interaction) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.REFRESH_SECONDS)
+                embed = await self.cog.build_balance_embed(self.guild_id, self.user_id)
+                await interaction.edit_original_response(embed=embed, view=self)
+        except asyncio.CancelledError:
+            pass
+        except discord.HTTPException:
+            pass
+
+    async def on_timeout(self) -> None:
+        if self._refresh_task:
+            self._refresh_task.cancel()
+
+
 class ShopPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -80,19 +136,9 @@ class ShopPanelView(discord.ui.View):
         label="💰 Баланс",
         style=discord.ButtonStyle.secondary,
         custom_id="shop:balance",
+        row=0,
     )
     async def balance_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild:
-            return
-        embed = await _balance_embed(interaction.guild.id, interaction.user.id)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @discord.ui.button(
-        label="👥 Мои рефералы",
-        style=discord.ButtonStyle.secondary,
-        custom_id="shop:referrals",
-    )
-    async def referrals_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
             return
         cog = interaction.client.get_cog("ShopCog")
@@ -100,39 +146,77 @@ class ShopPanelView(discord.ui.View):
             await interaction.response.send_message("Магазин недоступен.", ephemeral=True)
             return
 
+        embed = await cog.build_balance_embed(interaction.guild.id, interaction.user.id)
+        view = LiveBalanceView(cog, interaction.guild.id, interaction.user.id)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        view.start_refresh(interaction)
+
+    @discord.ui.button(
+        label="👥 Мои рефералы",
+        style=discord.ButtonStyle.secondary,
+        custom_id="shop:referrals",
+        row=0,
+    )
+    async def referrals_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+
         rules = await get_earning_rules(interaction.guild.id)
         if not rules["referral"]["enabled"]:
             await interaction.response.send_message("Рефералы отключены.", ephemeral=True)
             return
 
-        ref_pts = rules["referral"]["param1"]
-        refs = await get_referral_count(interaction.guild.id, interaction.user.id)
-        earned = refs * ref_pts
-
-        invite = await cog.get_or_create_referral_invite(interaction.guild, interaction.user.id)
-        if not invite:
-            await interaction.response.send_message(
-                "Не удалось создать реферальную ссылку. "
-                "Нужны права **Создавать приглашения** и настроенный канал.",
-                ephemeral=True,
-            )
-            return
-
-        embed = discord.Embed(title="👥 Мои рефералы", color=0x000000)
-        embed.add_field(name="Ссылка", value=invite.url, inline=False)
-        embed.add_field(name="Приглашено", value=f"**{refs}** чел.", inline=True)
-        embed.add_field(name="Заработано", value=f"**{earned}** баллов", inline=True)
-        embed.add_field(
-            name="Награда",
-            value=f"**{ref_pts}** баллов за каждого друга по ссылке",
-            inline=False,
-        )
+        embed = await build_my_referrals_embed(interaction.guild, interaction.user.id)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(
+        label="📝 Ввести рефку",
+        style=discord.ButtonStyle.primary,
+        custom_id="shop:enter_referral",
+        row=1,
+    )
+    async def enter_referral_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+        rules = await get_earning_rules(interaction.guild.id)
+        if not rules["referral"]["enabled"]:
+            await interaction.response.send_message("Рефералы отключены.", ephemeral=True)
+            return
+        await interaction.response.send_modal(EnterReferralModal())
+
+    @discord.ui.button(
+        label="➕ Создать рефку",
+        style=discord.ButtonStyle.secondary,
+        custom_id="shop:create_referral",
+        row=1,
+    )
+    async def create_referral_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+        rules = await get_earning_rules(interaction.guild.id)
+        if not rules["referral"]["enabled"]:
+            await interaction.response.send_message("Рефералы отключены.", ephemeral=True)
+            return
+        await interaction.response.send_modal(CreateReferralModal())
+
+    @discord.ui.button(
+        label="📺✈️ Бонус за подписку",
+        style=discord.ButtonStyle.secondary,
+        custom_id="shop:social_bonus",
+        row=2,
+    )
+    async def social_bonus_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cog = interaction.client.get_cog("SocialBonusCog")
+        if not cog or not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Недоступно.", ephemeral=True)
+            return
+        await cog.process_create_request(interaction)
 
     @discord.ui.button(
         label="🛒 Купить",
         style=discord.ButtonStyle.success,
         custom_id="shop:buy",
+        row=2,
     )
     async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
@@ -148,83 +232,118 @@ class ShopPanelView(discord.ui.View):
         )
 
 
-async def _balance_embed(guild_id: int, user_id: int) -> discord.Embed:
-    row = await get_shop_points(guild_id, user_id)
-    rules = await get_earning_rules(guild_id)
-    refs = await get_referral_count(guild_id, user_id)
-
-    voice = rules["voice"]
-    words = rules["words"]
-    voice_need = voice["param1"] * 60 if voice["enabled"] else 0
-    voice_left = max(0, voice_need - row["voice_buffer"]) if voice_need else 0
-    words_left = max(0, words["param1"] - row["word_buffer"]) if words["enabled"] else 0
-    words_today = row.get("words_points_today", 0)
-    words_cap = words["param3"] if words["enabled"] else 0
-
-    embed = discord.Embed(title="💰 Твой баланс", color=0x000000)
-    embed.add_field(name="Баллы", value=f"**{row['points']}**", inline=True)
-    embed.add_field(name="Рефералы", value=f"**{refs}**", inline=True)
-    progress = []
-    if voice["enabled"]:
-        progress.append(f"🎙️ ещё **{voice_left // 60}м {voice_left % 60}с** в войсе")
-    if words["enabled"]:
-        progress.append(f"💬 ещё **{words_left}** слов")
-        progress.append(f"📊 сегодня с слов: **{words_today}/{words_cap}** б.")
-    if progress:
-        embed.add_field(name="До награды", value="\n".join(progress), inline=False)
-    return embed
-
-
-def _count_words(text: str) -> int:
-    return len(_WORD_RE.findall(text))
-
-
-def _effective_words(
-    content: str,
-    last_content: str | None,
-    last_at: str | None,
-    now: datetime,
-) -> int:
-    words = _WORD_RE.findall(content)
-    if len(words) < 2:
-        return 0
-
-    if last_content and content.strip().lower() == last_content.strip().lower():
-        return 0
-
-    if last_at:
-        try:
-            prev = datetime.fromisoformat(last_at)
-            if prev.tzinfo is None:
-                prev = prev.replace(tzinfo=timezone.utc)
-            delta = (now - prev).total_seconds()
-            if delta < 1:
-                return 0
-            if delta < 3 and len(words) < 8:
-                return 0
-        except ValueError:
-            pass
-
-    lowered = [w.lower() for w in words]
-    if len(set(lowered)) == 1 and len(lowered) >= 3:
-        return 0
-
-    unique_ratio = len(set(lowered)) / len(lowered)
-    if unique_ratio < 0.35:
-        return max(0, int(len(words) * 0.25))
-
-    compact = content.replace(" ", "")
-    if len(compact) > 5 and len(set(compact)) <= 2:
-        return 0
-
-    return len(words)
-
-
 class ShopCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._voice_sessions: dict[tuple[int, int], datetime] = {}
-        self._invite_cache: dict[int, dict[str, int]] = {}
+        self._voice_task: asyncio.Task | None = None
+
+    def _pending_voice_seconds(self, guild_id: int, user_id: int) -> int:
+        key = (guild_id, user_id)
+        joined = self._voice_sessions.get(key)
+        if not joined:
+            return 0
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            self._voice_sessions.pop(key, None)
+            return 0
+        member = guild.get_member(user_id)
+        if (
+            not member
+            or not member.voice
+            or not member.voice.channel
+            or not self._counts_voice_time(
+                guild, member.voice.channel, voice_state=member.voice
+            )
+        ):
+            self._voice_sessions.pop(key, None)
+            return 0
+        return int((datetime.now(timezone.utc) - joined).total_seconds())
+
+    @staticmethod
+    def _voice_seconds_left(buffer_seconds: int, need_seconds: int) -> int:
+        if need_seconds <= 0:
+            return 0
+        remainder = buffer_seconds % need_seconds
+        return need_seconds - remainder if remainder else need_seconds
+
+    async def _sync_voice_session(self, guild_id: int, user_id: int) -> None:
+        key = (guild_id, user_id)
+        if key not in self._voice_sessions:
+            return
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+        member = guild.get_member(user_id)
+        if (
+            not member
+            or not member.voice
+            or not member.voice.channel
+            or not self._counts_voice_time(
+                guild, member.voice.channel, voice_state=member.voice
+            )
+        ):
+            return
+        now = datetime.now(timezone.utc)
+        await self._flush_voice_session(guild_id, user_id, now, end_session=False)
+
+    async def build_balance_embed(self, guild_id: int, user_id: int) -> discord.Embed:
+        await self._sync_voice_session(guild_id, user_id)
+        row = await get_shop_points(guild_id, user_id)
+        rules = await get_earning_rules(guild_id)
+        refs = await get_referral_count(guild_id, user_id)
+        guild = self.bot.get_guild(guild_id)
+        member = guild.get_member(user_id) if guild else None
+
+        voice = rules["voice"]
+        words = rules["words"]
+        voice_need = voice["param1"] * 60 if voice["enabled"] else 0
+        voice_paused = False
+        if (
+            member
+            and member.voice
+            and member.voice.channel
+            and guild
+            and not self._counts_voice_time(
+                guild, member.voice.channel, voice_state=member.voice
+            )
+        ):
+            voice_paused = True
+
+        voice_buffer = row["voice_buffer"] + self._pending_voice_seconds(guild_id, user_id)
+        voice_left = self._voice_seconds_left(voice_buffer, voice_need)
+        words_left = max(0, words["param1"] - row["word_buffer"]) if words["enabled"] else 0
+        words_today = row.get("words_points_today", 0)
+        words_cap = words["param3"] if words["enabled"] else 0
+
+        embed = discord.Embed(title="💰 Твой баланс", color=0x000000)
+        embed.add_field(name="Баллы", value=f"**{row['points']}**", inline=True)
+        embed.add_field(name="Рефералы", value=f"**{refs}**", inline=True)
+
+        referrer = await get_user_referrer(guild_id, user_id)
+        if referrer and guild:
+            inviter = guild.get_member(referrer["inviter_id"])
+            inviter_label = inviter.mention if inviter else f"<@{referrer['inviter_id']}>"
+            code_label = referrer.get("code") or "—"
+            embed.add_field(
+                name="Введённая рефка",
+                value=f"`{code_label}` · {inviter_label}",
+                inline=False,
+            )
+
+        progress = []
+        if voice["enabled"]:
+            progress.append(f"🎙️ ещё **{voice_left // 60}м {voice_left % 60}с** в войсе")
+            if voice_paused:
+                progress.append("⏸️ сейчас время **не идёт** (AFK или мут от прав)")
+        if words["enabled"]:
+            progress.append(f"💬 ещё **{words_left}** слов")
+            cap_label = "∞" if words_cap <= 0 else str(words_cap)
+            progress.append(f"📊 сегодня с слов: **{words_today}/{cap_label}** б.")
+        if progress:
+            embed.add_field(name="До награды", value="\n".join(progress), inline=False)
+        embed.set_footer(text="Обновляется автоматически")
+        return embed
 
     async def cog_load(self):
         self.bot.add_view(ShopPanelView())
@@ -233,124 +352,136 @@ class ShopCog(commands.Cog):
 
         now = datetime.now(timezone.utc)
         for guild in self.bot.guilds:
-            await self._refresh_invite_cache(guild)
-            for channel in guild.voice_channels:
+            for channel in list(guild.voice_channels) + list(guild.stage_channels):
+                if not self._counts_voice_time(guild, channel):
+                    continue
                 for member in channel.members:
-                    if not member.bot:
+                    if member.bot:
+                        continue
+                    if member.voice and self._counts_voice_time(
+                        guild, channel, voice_state=member.voice
+                    ):
                         self._voice_sessions[(guild.id, member.id)] = now
 
-    async def _refresh_invite_cache(self, guild: discord.Guild) -> None:
-        try:
-            invites = await guild.invites()
-            self._invite_cache[guild.id] = {i.code: i.uses or 0 for i in invites}
-        except discord.Forbidden:
-            self._invite_cache[guild.id] = {}
-        except discord.HTTPException as exc:
-            log.warning("Не удалось обновить инвайты на %s: %s", guild.id, exc)
+        self._voice_task = asyncio.create_task(self._voice_tick_loop())
 
-    async def _resolve_invite_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
-        settings = await get_settings(guild.id)
-        ch_id = settings.get("welcome_channel_id")
-        if ch_id:
-            ch = guild.get_channel(ch_id)
-            if isinstance(ch, discord.TextChannel):
-                perms = ch.permissions_for(guild.me)
-                if perms.create_instant_invite:
-                    return ch
-
-        if guild.system_channel:
-            perms = guild.system_channel.permissions_for(guild.me)
-            if perms.create_instant_invite:
-                return guild.system_channel
-
-        for ch in guild.text_channels:
-            if ch.permissions_for(guild.me).create_instant_invite:
-                return ch
-        return None
-
-    async def get_or_create_referral_invite(
-        self,
-        guild: discord.Guild,
-        user_id: int,
-    ) -> discord.Invite | None:
-        stored_code = await get_referral_invite_code(guild.id, user_id)
-        if stored_code:
+    async def cog_unload(self):
+        if self._voice_task:
+            self._voice_task.cancel()
             try:
-                invites = await guild.invites()
-            except (discord.Forbidden, discord.HTTPException):
-                invites = []
-            for inv in invites:
-                if inv.code == stored_code:
-                    return inv
+                await self._voice_task
+            except asyncio.CancelledError:
+                pass
 
-        channel = await self._resolve_invite_channel(guild)
-        if not channel:
-            return None
+    @staticmethod
+    def _is_afk_channel(guild: discord.Guild, channel: discord.abc.GuildChannel) -> bool:
+        if guild.afk_channel and channel.id == guild.afk_channel.id:
+            return True
+        if _text_looks_afk(channel.name):
+            return True
+        category = getattr(channel, "category", None)
+        if category and _text_looks_afk(category.name):
+            return True
+        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            perms = channel.permissions_for(guild.default_role)
+            if perms.connect and not perms.speak:
+                return True
+        return False
 
-        await get_or_create_referral_code(guild.id, user_id)
-        try:
-            invite = await channel.create_invite(
-                max_age=0,
-                max_uses=0,
-                unique=True,
-                reason=f"Реферальная ссылка пользователя {user_id}",
-            )
-        except discord.HTTPException as exc:
-            log.warning("Не удалось создать инвайт для %s: %s", user_id, exc)
-            return None
+    @staticmethod
+    def _counts_voice_time(
+        guild: discord.Guild,
+        channel: discord.abc.GuildChannel | None,
+        *,
+        voice_state: discord.VoiceState | None = None,
+    ) -> bool:
+        if channel is None:
+            return False
+        if ShopCog._is_afk_channel(guild, channel):
+            return False
+        if voice_state is not None and voice_state.mute:
+            return False
+        return True
 
-        await set_referral_invite_code(guild.id, user_id, invite.code)
-        cache = self._invite_cache.setdefault(guild.id, {})
-        cache[invite.code] = invite.uses or 0
-        return invite
-
-    async def _process_referral_join(self, member: discord.Member) -> None:
-        guild = member.guild
-        rules = await get_earning_rules(guild.id)
-        if not rules["referral"]["enabled"]:
-            return
-
-        if await referral_already_used(guild.id, member.id):
-            return
-
-        before = dict(self._invite_cache.get(guild.id, {}))
-        try:
-            invites = await guild.invites()
-        except discord.Forbidden:
-            return
-        except discord.HTTPException as exc:
-            log.warning("Не удалось получить инвайты при входе %s: %s", member.id, exc)
-            return
-
-        used_code: str | None = None
-        for invite in invites:
-            old = before.get(invite.code, 0)
-            new = invite.uses or 0
-            if new > old:
-                used_code = invite.code
+    async def _voice_tick_loop(self) -> None:
+        await self.bot.wait_until_ready()
+        while True:
+            try:
+                await asyncio.sleep(15)
+                await self._prune_invalid_voice_sessions()
+                await self._flush_all_voice_sessions()
+            except asyncio.CancelledError:
                 break
+            except Exception:
+                log.exception("Ошибка тика начисления войса")
 
-        self._invite_cache[guild.id] = {i.code: (i.uses or 0) for i in invites}
-        if not used_code:
+    async def _prune_invalid_voice_sessions(self) -> None:
+        for guild_id, user_id in list(self._voice_sessions):
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                self._voice_sessions.pop((guild_id, user_id), None)
+                continue
+            member = guild.get_member(user_id)
+            if (
+                not member
+                or not member.voice
+                or not member.voice.channel
+                or not self._counts_voice_time(
+                    guild, member.voice.channel, voice_state=member.voice
+                )
+            ):
+                self._voice_sessions.pop((guild_id, user_id), None)
+
+    async def _flush_all_voice_sessions(self) -> None:
+        now = datetime.now(timezone.utc)
+        for guild_id, user_id in list(self._voice_sessions):
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                self._voice_sessions.pop((guild_id, user_id), None)
+                continue
+            member = guild.get_member(user_id)
+            if (
+                not member
+                or not member.voice
+                or not member.voice.channel
+                or not self._counts_voice_time(
+                    guild, member.voice.channel, voice_state=member.voice
+                )
+            ):
+                self._voice_sessions.pop((guild_id, user_id), None)
+                continue
+            await self._flush_voice_session(guild_id, user_id, now, end_session=False)
+
+    async def _flush_voice_session(
+        self,
+        guild_id: int,
+        user_id: int,
+        now: datetime,
+        *,
+        end_session: bool,
+    ) -> None:
+        key = (guild_id, user_id)
+        joined = self._voice_sessions.pop(key, None) if end_session else self._voice_sessions.get(key)
+        if not joined:
             return
 
-        inviter_id = await get_referral_inviter_by_invite(guild.id, used_code)
-        if not inviter_id or inviter_id == member.id:
+        seconds = int((now - joined).total_seconds())
+        if seconds > 0:
+            rules = await get_earning_rules(guild_id)
+            if rules["voice"]["enabled"]:
+                seconds_per = rules["voice"]["param1"] * 60
+                points_per = rules["voice"]["param2"]
+                await add_voice_seconds(
+                    guild_id,
+                    user_id,
+                    seconds,
+                    seconds_per_reward=seconds_per,
+                    points_per_reward=points_per,
+                )
+
+        if end_session:
             return
-
-        if not await register_referral(guild.id, inviter_id, member.id):
-            return
-
-        ref_pts = rules["referral"]["param1"]
-        inviter_total = await adjust_shop_points(guild.id, inviter_id, ref_pts)
-        inviter = guild.get_member(inviter_id)
-        inviter_str = inviter.mention if inviter else f"<@{inviter_id}>"
-
-        await log_server(
-            guild,
-            f"**Реферал**\n{inviter_str} ← {member.mention}\n"
-            f"+**{ref_pts}** (всего **{inviter_total}**)",
-        )
+        self._voice_sessions[key] = now
 
     async def process_purchase(self, interaction: discord.Interaction, item_key: str):
         if not interaction.guild:
@@ -458,17 +589,6 @@ class ShopCog(commands.Cog):
         if not accepted:
             await adjust_shop_points(row["guild_id"], row["user_id"], row["cost"])
 
-        user = self.bot.get_user(row["user_id"]) or await self.bot.fetch_user(row["user_id"])
-        dm_view = verdict_dm_view(
-            accepted=accepted,
-            prize_name=row["prize_name"],
-            cost=row["cost"],
-        )
-        try:
-            await user.send(view=dm_view)
-        except discord.HTTPException:
-            log.warning("Не удалось отправить ЛС пользователю %s", row["user_id"])
-
         status_text = "✅ Принято" if accepted else "❌ Отклонено · баллы возвращены"
         embed = interaction.message.embeds[0] if interaction.message and interaction.message.embeds else None
         if embed:
@@ -493,37 +613,14 @@ class ShopCog(commands.Cog):
             except discord.HTTPException:
                 log.warning("Не удалось убрать покупателя из тикета #%s", redemption_id)
 
-            close_view = CloseTicketView(redemption_id)
-            self.bot.add_view(close_view)
             footer = (
                 f"{status_text} — {interaction.user.mention}\n"
-                f"Покупатель убран из тикета. Админ может закрыть канал кнопкой ниже."
+                f"Покупатель убран из тикета. Канал остаётся для админов."
             )
             try:
-                await ticket_ch.send(footer, view=close_view)
+                await ticket_ch.send(footer)
             except discord.HTTPException:
                 pass
-
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member):
-        if member.bot:
-            return
-        await self._process_referral_join(member)
-
-    @commands.Cog.listener()
-    async def on_invite_create(self, invite: discord.Invite):
-        if not invite.guild:
-            return
-        cache = self._invite_cache.setdefault(invite.guild.id, {})
-        cache[invite.code] = invite.uses or 0
-
-    @commands.Cog.listener()
-    async def on_invite_delete(self, invite: discord.Invite):
-        if not invite.guild:
-            return
-        cache = self._invite_cache.get(invite.guild.id)
-        if cache:
-            cache.pop(invite.code, None)
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -539,41 +636,29 @@ class ShopCog(commands.Cog):
         if not rules["voice"]["enabled"]:
             return
 
-        seconds_per = rules["voice"]["param1"] * 60
-        points_per = rules["voice"]["param2"]
+        earn_before = self._counts_voice_time(
+            member.guild, before.channel, voice_state=before
+        )
+        earn_after = self._counts_voice_time(
+            member.guild, after.channel, voice_state=after
+        )
         key = (member.guild.id, member.id)
         now = datetime.now(timezone.utc)
+        mute_changed = before.mute != after.mute
 
-        if before.channel is None and after.channel is not None:
-            self._voice_sessions[key] = now
-            return
+        if earn_before and (
+            not earn_after or before.channel != after.channel or mute_changed
+        ):
+            await self._flush_voice_session(
+                member.guild.id,
+                member.id,
+                now,
+                end_session=not earn_after,
+            )
 
-        if before.channel is not None and after.channel is None:
-            joined = self._voice_sessions.pop(key, None)
-            if joined:
-                seconds = int((now - joined).total_seconds())
-                if seconds > 0:
-                    await add_voice_seconds(
-                        member.guild.id,
-                        member.id,
-                        seconds,
-                        seconds_per_reward=seconds_per,
-                        points_per_reward=points_per,
-                    )
-            return
-
-        if before.channel != after.channel and after.channel is not None:
-            joined = self._voice_sessions.get(key)
-            if joined:
-                seconds = int((now - joined).total_seconds())
-                if seconds > 0:
-                    await add_voice_seconds(
-                        member.guild.id,
-                        member.id,
-                        seconds,
-                        seconds_per_reward=seconds_per,
-                        points_per_reward=points_per,
-                    )
+        if earn_after and (
+            not earn_before or before.channel != after.channel or mute_changed
+        ):
             self._voice_sessions[key] = now
 
     @commands.Cog.listener()
@@ -581,35 +666,49 @@ class ShopCog(commands.Cog):
         if not message.guild or message.author.bot:
             return
 
+        if message.type in _BOOST_MESSAGE_TYPES:
+            if await mark_boost_message_processed(message.id):
+                total = (
+                    int(message.content)
+                    if message.content and message.content.isdigit()
+                    else 1
+                )
+                points = await award_boost_points(
+                    message.guild.id,
+                    message.author.id,
+                    total,
+                )
+                if points > 0:
+                    await log_server(
+                        message.guild,
+                        f"**Буст сервера**\n{message.author.mention} · "
+                        f"**{total}** буст(ов) · +**{points}** б.",
+                    )
+            return
+
         rules = await get_earning_rules(message.guild.id)
         if not rules["words"]["enabled"]:
             return
 
-        row = await get_shop_points(message.guild.id, message.author.id)
         now = datetime.now(timezone.utc)
-        words = _effective_words(
-            message.content,
-            row.get("last_message_content"),
-            row.get("last_message_at"),
-            now,
-        )
-        await update_message_meta(
+        await apply_chat_message(
             message.guild.id,
             message.author.id,
             content=message.content,
             at=now.isoformat(),
-        )
-        if words <= 0:
-            return
-
-        await add_message_words(
-            message.guild.id,
-            message.author.id,
-            words,
             words_per_reward=rules["words"]["param1"],
             points_per_reward=rules["words"]["param2"],
             daily_cap=rules["words"]["param3"],
         )
+
+    @app_commands.command(name="баллы", description="Список баллов участников (админ)")
+    @admin_only()
+    async def list_points(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        rows = await get_all_shop_points(interaction.guild.id)
+        embeds = build_admin_points_embeds(interaction.guild, rows)
+        await interaction.response.send_message(embeds=embeds, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

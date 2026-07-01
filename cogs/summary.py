@@ -19,6 +19,11 @@ PANEL_LABELS = {
     "social": "📱 Соцсети",
     "rules": "📜 Правила",
     "shop": "🛒 Магазин",
+    "giveaway": "🎁 Розыгрыши",
+    "leaderboard_points": "🏆 Лидерборд (баллы)",
+    "leaderboard_referrals": "👥 Лидерборд (рефералы)",
+    "leaderboard_squads": "🛡️ Лидерборд (сквады)",
+    "squad_manage": "⚙️ Сквады (управление)",
 }
 
 
@@ -61,8 +66,25 @@ def _earning_summary(rules: dict[str, dict]) -> str:
         )
     referral = rules.get("referral", {})
     if referral.get("enabled"):
-        lines.append(f"👥 реферал → {referral['param1']} б.")
+        lines.append(
+            f"👥 реферал → владельцу {referral['param1']} б., вводящему {referral['param3']} б."
+        )
+    boost = rules.get("boost", {})
+    if boost.get("enabled"):
+        lines.append(f"🚀 буст → {boost['param1']} б. за каждый буст")
+    twitch = rules.get("twitch", {})
+    telegram = rules.get("telegram", {})
+    if twitch.get("enabled"):
+        lines.append(f"📺 Twitch → до {twitch['param1']} б., тикет (один раз)")
+    if telegram.get("enabled"):
+        lines.append(f"✈️ Telegram → до {telegram['param1']} б., тикет (один раз)")
     return "\n".join(lines) if lines else "— всё выключено"
+
+
+def _clamp_field(text: str, limit: int = 1024) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20] + "\n… *(обрезано)*"
 
 
 class SummaryCog(commands.Cog):
@@ -94,33 +116,33 @@ class SummaryCog(commands.Cog):
         if settings.get("admin_role_id"):
             admin_parts.append(f"Роль админа: {_role(guild, settings['admin_role_id'])}")
         admin_parts.append(f"Админ в конфиге: {rules_admin_mention()}")
-        embed.add_field(name="👑 Админ", value="\n".join(admin_parts), inline=False)
+        embed.add_field(name="👑 Админ", value=_clamp_field("\n".join(admin_parts)), inline=False)
 
         welcome_lines = [f"Канал: {_ch(guild, settings.get('welcome_channel_id'))}"]
         if (WELCOME_IMAGE_URL or "").strip():
             welcome_lines.append(f"Картинка: [ссылка]({WELCOME_IMAGE_URL.strip()})")
         else:
             welcome_lines.append("Картинка: из `foto/` или —")
-        embed.add_field(name="👋 Приветствия", value="\n".join(welcome_lines), inline=False)
+        embed.add_field(name="👋 Приветствия", value=_clamp_field("\n".join(welcome_lines)), inline=False)
 
         if panels:
             panels_value = "\n".join(_panel_line(guild, p) for p in panels)
         else:
             panels_value = "— ни одна панель не опубликована (`/панель`)"
-        embed.add_field(name="📌 Панели", value=panels_value, inline=False)
+        embed.add_field(name="📌 Панели", value=_clamp_field(panels_value), inline=False)
 
         roles_value = (
             "\n".join(f"• {_role(guild, b['role_id'])}" for b in bindings)
             if bindings
             else "— роли не добавлены (`/роли-настройка`)"
         )
-        embed.add_field(name="🎭 Роли на панели", value=roles_value, inline=False)
+        embed.add_field(name="🎭 Роли на панели", value=_clamp_field(roles_value), inline=False)
 
         logs_value = (
             f"Сервер: {_ch(guild, settings.get('server_log_channel_id'))}\n"
             f"Бот: {_ch(guild, settings.get('bot_log_channel_id'))}"
         )
-        embed.add_field(name="📋 Логи", value=logs_value, inline=False)
+        embed.add_field(name="📋 Логи", value=_clamp_field(logs_value), inline=False)
 
         if voice:
             voice_value = (
@@ -129,15 +151,15 @@ class SummaryCog(commands.Cog):
             )
         else:
             voice_value = "— не настроен (`/войс-настройка`)"
-        embed.add_field(name="🔊 Кастом войс", value=voice_value, inline=False)
+        embed.add_field(name="🔊 Кастом войс", value=_clamp_field(voice_value), inline=False)
 
         ticket_cat = settings.get("shop_ticket_category_id")
         shop_value = (
             f"Категория тикетов: {_ch(guild, ticket_cat)}\n"
             f"Товаров: **{len(items)}**"
         )
-        embed.add_field(name="🛒 Магазин", value=shop_value, inline=False)
-        embed.add_field(name="💰 Начисление", value=_earning_summary(rules), inline=False)
+        embed.add_field(name="🛒 Магазин", value=_clamp_field(shop_value), inline=False)
+        embed.add_field(name="💰 Начисление", value=_clamp_field(_earning_summary(rules)), inline=False)
 
         if twitch:
             twitch_lines = []
@@ -153,7 +175,7 @@ class SummaryCog(commands.Cog):
             twitch_value = "\n".join(twitch_lines)
         else:
             twitch_value = "— нет алертов (`/твич-настройка`)"
-        embed.add_field(name="📺 Twitch", value=twitch_value, inline=False)
+        embed.add_field(name="📺 Twitch", value=_clamp_field(twitch_value), inline=False)
 
         embed.set_footer(text="Тексты панелей и ссылки соцсетей — в config.py / .env")
         await interaction.response.send_message(embed=embed, ephemeral=True)
