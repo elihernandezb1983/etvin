@@ -25,11 +25,13 @@ from config import (
     rules_admin_mention,
     SHOP_PANEL_TITLE,
     SHOP_PANEL_IMAGE,
+    SERVER_TAG_BONUS_POINTS,
     SHOP_SQUAD_INVITE,
     GIVEAWAY_PANEL_IMAGE,
 )
 from utils.database import get_shop_items, get_earning_rules
 from utils.social_ui import format_social_bonus_earning_lines, social_bonus_enabled
+from utils.server_tag import multiplier_label
 
 
 def role_panel_embed() -> discord.Embed:
@@ -215,6 +217,10 @@ async def shop_panel_embed(guild: discord.Guild, image_url: str | None = None) -
             f"🚀 **Буст сервера** — **{boost['param1']}** баллов за каждый буст"
         )
     earning_lines.extend(format_social_bonus_earning_lines(rules))
+    earning_lines.append(
+        f"🏷️ **Тег сервера** — **{SERVER_TAG_BONUS_POINTS}** б. один раз · "
+        f"**×{multiplier_label()}** ко всем наградам (кроме рефки), пока тег включён"
+    )
     earning = "\n".join(earning_lines) if earning_lines else "— правила не настроены"
 
     if items:

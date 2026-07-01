@@ -184,6 +184,11 @@ async def init_db():
             await db.execute("ALTER TABLE shop_points ADD COLUMN last_message_at TEXT")
         if pts_cols and "last_message_content" not in pts_cols:
             await db.execute("ALTER TABLE shop_points ADD COLUMN last_message_content TEXT")
+        if pts_cols and "server_tag_bonus_granted" not in pts_cols:
+            await db.execute(
+                "ALTER TABLE shop_points ADD COLUMN server_tag_bonus_granted "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
         async with db.execute("PRAGMA table_info(shop_redemptions)") as c:
             red_cols = {row[1] for row in await c.fetchall()}
         if red_cols and "order_message_id" not in red_cols:
@@ -340,6 +345,7 @@ async def get_shop_points(guild_id: int, user_id: int) -> dict:
         "words_day": "",
         "last_message_at": None,
         "last_message_content": None,
+        "server_tag_bonus_granted": 0,
     }
 
 
@@ -553,6 +559,30 @@ async def adjust_shop_points(guild_id: int, user_id: int, delta: int) -> int:
     return new_points
 
 
+async def try_grant_server_tag_bonus(guild_id: int, user_id: int, amount: int) -> int:
+    if amount <= 0:
+        return 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await _ensure_shop_row(db, guild_id, user_id)
+        await db.commit()
+        async with db.execute(
+            "SELECT server_tag_bonus_granted, points FROM shop_points "
+            "WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ) as c:
+            row = await c.fetchone()
+        if row["server_tag_bonus_granted"]:
+            return 0
+        await db.execute(
+            "UPDATE shop_points SET points = points + ?, server_tag_bonus_granted = 1 "
+            "WHERE guild_id = ? AND user_id = ?",
+            (amount, guild_id, user_id),
+        )
+        await db.commit()
+    return amount
+
+
 async def get_boost_awarded_count(guild_id: int, user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -587,12 +617,19 @@ async def mark_boost_message_processed(message_id: int) -> bool:
             return False
 
 
-async def award_boost_points(guild_id: int, user_id: int, total_boosts: int) -> int:
+async def award_boost_points(
+    guild_id: int,
+    user_id: int,
+    total_boosts: int,
+    *,
+    points_per: int | None = None,
+) -> int:
     rules = await get_earning_rules(guild_id)
     boost_rule = rules.get("boost", {})
     if not boost_rule.get("enabled"):
         return 0
-    points_per = boost_rule.get("param1", 0)
+    if points_per is None:
+        points_per = boost_rule.get("param1", 0)
     if points_per <= 0 or total_boosts <= 0:
         return 0
 

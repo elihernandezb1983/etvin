@@ -13,6 +13,7 @@ from utils.database import (
     approve_social_request,
     reject_social_request,
     get_pending_social_requests,
+    get_social_request,
 )
 from utils.discord_log import log_server
 from utils.permissions import is_admin
@@ -24,6 +25,7 @@ from utils.social_ui import (
     social_bonus_enabled,
     default_social_bonus_points,
 )
+from utils.server_tag import scale_reward, user_has_server_tag
 
 log = logging.getLogger("etvin")
 
@@ -140,10 +142,25 @@ class SocialBonusCog(commands.Cog):
             await interaction.response.send_message("Только для админов.", ephemeral=True)
             return
 
+        req_preview = await get_social_request(request_id)
+        if not req_preview:
+            await interaction.response.send_message("Заявка не найдена.", ephemeral=True)
+            return
+
+        member = interaction.guild.get_member(req_preview["user_id"])
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(req_preview["user_id"])
+            except discord.HTTPException:
+                member = None
+
+        has_tag = bool(member and user_has_server_tag(member, interaction.guild.id))
+        final_points = scale_reward(points, has_tag)
+
         ok, msg, req = await approve_social_request(
             request_id,
             admin_id=interaction.user.id,
-            points=points,
+            points=final_points,
         )
         if not ok or not req:
             await interaction.response.send_message(msg, ephemeral=True)
@@ -162,7 +179,7 @@ class SocialBonusCog(commands.Cog):
             embed.color = discord.Color(0x000000)
             embed.add_field(
                 name="Решение",
-                value=f"✅ Принято — +**{points}** б. · {interaction.user.mention}",
+                value=f"✅ Принято — +**{final_points}** б. · {interaction.user.mention}",
                 inline=False,
             )
 
@@ -171,7 +188,7 @@ class SocialBonusCog(commands.Cog):
             await ticket_msg.edit(embed=embed, view=None)
         else:
             await interaction.response.send_message(
-                f"✅ Заявка одобрена — +**{points}** б.",
+                f"✅ Заявка одобрена — +**{final_points}** б.",
                 ephemeral=True,
             )
 
@@ -179,7 +196,7 @@ class SocialBonusCog(commands.Cog):
             try:
                 await remove_buyer_from_ticket(ticket_ch, req["user_id"])
                 await ticket_ch.send(
-                    f"✅ Заявка одобрена — +**{points}** б. · {interaction.user.mention}"
+                    f"✅ Заявка одобрена — +**{final_points}** б. · {interaction.user.mention}"
                 )
             except discord.HTTPException:
                 pass
@@ -189,7 +206,7 @@ class SocialBonusCog(commands.Cog):
         await log_server(
             interaction.guild,
             f"**Бонус за подписку** #{request_id}\n"
-            f"{member_label} · +**{points}** б.\n"
+            f"{member_label} · +**{final_points}** б.\n"
             f"{interaction.user.mention}",
         )
 

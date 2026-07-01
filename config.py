@@ -197,6 +197,11 @@ SHOP_BOOST_POINTS = _env_int("SHOP_BOOST_POINTS", 250)
 SHOP_TWITCH_FOLLOW_POINTS = _env_int("SHOP_TWITCH_FOLLOW_POINTS", 100)
 SHOP_TELEGRAM_JOIN_POINTS = _env_int("SHOP_TELEGRAM_JOIN_POINTS", 100)
 
+# Бонус за тег сервера (primary guild): один раз + множитель на награды (кроме рефки)
+SERVER_TAG_BONUS_POINTS = _env_int("SERVER_TAG_BONUS_POINTS", 100)
+SERVER_TAG_MULTIPLIER_NUM = _env_int("SERVER_TAG_MULTIPLIER_NUM", 3)
+SERVER_TAG_MULTIPLIER_DEN = _env_int("SERVER_TAG_MULTIPLIER_DEN", 2)
+
 # Telegram-бот для проверки подписки на канал (опционально)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")  # @channel или -100...

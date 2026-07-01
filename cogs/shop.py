@@ -8,6 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import config
 from utils.database import (
     get_shop_points,
     get_shop_items,
@@ -27,9 +28,11 @@ from utils.database import (
     award_boost_points,
     mark_boost_message_processed,
     get_all_shop_points,
+    try_grant_server_tag_bonus,
 )
 from utils.discord_log import log_server
 from utils.permissions import admin_only
+from utils.server_tag import scale_reward, user_has_server_tag, multiplier_label
 from utils.shop_tickets import create_shop_ticket, remove_buyer_from_ticket
 from utils.shop_ui import (
     order_request_embed,
@@ -267,6 +270,22 @@ class ShopCog(commands.Cog):
         remainder = buffer_seconds % need_seconds
         return need_seconds - remainder if remainder else need_seconds
 
+    async def _apply_server_tag(self, guild: discord.Guild, user: discord.abc.User) -> bool:
+        if not user_has_server_tag(user, guild.id):
+            return False
+        bonus = await try_grant_server_tag_bonus(
+            guild.id,
+            user.id,
+            config.SERVER_TAG_BONUS_POINTS,
+        )
+        if bonus > 0:
+            label = user.mention if isinstance(user, discord.Member) else f"<@{user.id}>"
+            await log_server(
+                guild,
+                f"**Тег сервера · бонус**\n{label} · +**{bonus}** б. (один раз)",
+            )
+        return True
+
     async def _sync_voice_session(self, guild_id: int, user_id: int) -> None:
         key = (guild_id, user_id)
         if key not in self._voice_sessions:
@@ -289,11 +308,13 @@ class ShopCog(commands.Cog):
 
     async def build_balance_embed(self, guild_id: int, user_id: int) -> discord.Embed:
         await self._sync_voice_session(guild_id, user_id)
+        guild = self.bot.get_guild(guild_id)
+        member = guild.get_member(user_id) if guild else None
+        if guild and member:
+            await self._apply_server_tag(guild, member)
         row = await get_shop_points(guild_id, user_id)
         rules = await get_earning_rules(guild_id)
         refs = await get_referral_count(guild_id, user_id)
-        guild = self.bot.get_guild(guild_id)
-        member = guild.get_member(user_id) if guild else None
 
         voice = rules["voice"]
         words = rules["words"]
@@ -315,10 +336,19 @@ class ShopCog(commands.Cog):
         words_left = max(0, words["param1"] - row["word_buffer"]) if words["enabled"] else 0
         words_today = row.get("words_points_today", 0)
         words_cap = words["param3"] if words["enabled"] else 0
+        tag_active = bool(member and user_has_server_tag(member, guild_id))
+        if words_cap > 0 and tag_active:
+            words_cap = scale_reward(words_cap, True)
 
         embed = discord.Embed(title="💰 Твой баланс", color=0x000000)
         embed.add_field(name="Баллы", value=f"**{row['points']}**", inline=True)
         embed.add_field(name="Рефералы", value=f"**{refs}**", inline=True)
+        if tag_active:
+            embed.add_field(
+                name="🏷️ Тег сервера",
+                value=f"**×{multiplier_label()}** к наградам",
+                inline=True,
+            )
 
         referrer = await get_user_referrer(guild_id, user_id)
         if referrer and guild:
@@ -469,8 +499,19 @@ class ShopCog(commands.Cog):
         if seconds > 0:
             rules = await get_earning_rules(guild_id)
             if rules["voice"]["enabled"]:
+                guild = self.bot.get_guild(guild_id)
+                member = guild.get_member(user_id) if guild else None
+                has_tag = False
+                if guild:
+                    if not member:
+                        try:
+                            member = await guild.fetch_member(user_id)
+                        except discord.HTTPException:
+                            member = None
+                    if member:
+                        has_tag = await self._apply_server_tag(guild, member)
                 seconds_per = rules["voice"]["param1"] * 60
-                points_per = rules["voice"]["param2"]
+                points_per = scale_reward(rules["voice"]["param2"], has_tag)
                 await add_voice_seconds(
                     guild_id,
                     user_id,
@@ -659,7 +700,16 @@ class ShopCog(commands.Cog):
         if earn_after and (
             not earn_before or before.channel != after.channel or mute_changed
         ):
+            await self._apply_server_tag(member.guild, member)
             self._voice_sessions[key] = now
+
+    @commands.Cog.listener()
+    async def on_user_update(self, before: discord.User, after: discord.User):
+        if after.bot:
+            return
+        for guild in self.bot.guilds:
+            if user_has_server_tag(after, guild.id):
+                await self._apply_server_tag(guild, after)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -673,10 +723,15 @@ class ShopCog(commands.Cog):
                     if message.content and message.content.isdigit()
                     else 1
                 )
+                rules = await get_earning_rules(message.guild.id)
+                has_tag = await self._apply_server_tag(message.guild, message.author)
+                boost = rules.get("boost", {})
+                points_per = scale_reward(boost.get("param1", 0), has_tag)
                 points = await award_boost_points(
                     message.guild.id,
                     message.author.id,
                     total,
+                    points_per=points_per,
                 )
                 if points > 0:
                     await log_server(
@@ -690,6 +745,7 @@ class ShopCog(commands.Cog):
         if not rules["words"]["enabled"]:
             return
 
+        has_tag = await self._apply_server_tag(message.guild, message.author)
         now = datetime.now(timezone.utc)
         await apply_chat_message(
             message.guild.id,
@@ -697,8 +753,8 @@ class ShopCog(commands.Cog):
             content=message.content,
             at=now.isoformat(),
             words_per_reward=rules["words"]["param1"],
-            points_per_reward=rules["words"]["param2"],
-            daily_cap=rules["words"]["param3"],
+            points_per_reward=scale_reward(rules["words"]["param2"], has_tag),
+            daily_cap=scale_reward(rules["words"]["param3"], has_tag),
         )
 
     @app_commands.command(name="баллы", description="Список баллов участников (админ)")
