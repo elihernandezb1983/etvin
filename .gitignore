@@ -2,5 +2,6 @@ __pycache__/
 *.py[cod]
 .env
 data/*.db
+data/bot.lock
 .venv/
 venv/
