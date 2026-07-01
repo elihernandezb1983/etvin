@@ -27,13 +27,13 @@ class EarningSetupCog(commands.Cog):
     @app_commands.command(name="начислить-баллы", description="Выдать баллы участнику")
     @admin_only()
     @app_commands.describe(
-        пользователь="Кому начислить",
+        пользователь="Кому начислить (выбери через @)",
         количество="Сколько баллов",
     )
     async def grant_points(
         self,
         interaction: discord.Interaction,
-        пользователь: discord.Member,
+        пользователь: discord.User,
         количество: app_commands.Range[int, 1, 1_000_000],
     ):
         if not interaction.guild:
@@ -56,13 +56,13 @@ class EarningSetupCog(commands.Cog):
     @app_commands.command(name="убрать-баллы", description="Снять баллы у участника")
     @admin_only()
     @app_commands.describe(
-        пользователь="У кого снять",
+        пользователь="У кого снять (выбери через @)",
         количество="Сколько баллов",
     )
     async def remove_points(
         self,
         interaction: discord.Interaction,
-        пользователь: discord.Member,
+        пользователь: discord.User,
         количество: app_commands.Range[int, 1, 1_000_000],
     ):
         if not interaction.guild:
